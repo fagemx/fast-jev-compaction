@@ -1,7 +1,10 @@
 {
   "name": "fast-jev-compaction",
   "version": "0.2.0",
-  "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model.",
+  "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model, with a Claude Code plugin and a Pi extension.",
+  "keywords": [
+    "pi-package"
+  ],
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -18,13 +21,27 @@
     "README.md",
     "LICENSE"
   ],
+  "pi": {
+    "extensions": [
+      "./pi/fast-jev.ts"
+    ]
+  },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit && npm run typecheck:hooks",
+    "typecheck": "tsc --noEmit && npm run typecheck:hooks && npm run typecheck:pi",
     "test": "vitest run",
     "demo": "tsx examples/demo.ts",
     "typecheck:hooks": "tsc -p tsconfig.hooks.json",
-    "validate:plugin": "claude plugin validate .claude-plugin/plugin.json"
+    "validate:plugin": "claude plugin validate .claude-plugin/plugin.json",
+    "typecheck:pi": "tsc -p tsconfig.pi.json"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

@@ -162,11 +162,42 @@ To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
 
+## Pi extension
+
+The repository is also a [Pi](https://pi.dev) package: `pi/fast-jev.ts` runs
+the same library at the end of every turn whose context is at or above
+`compactAtPercent`. Pi has no message-list replacement, so the result lands as
+Pi's own append-only `context_edit` entries: a dropped call is removed from its
+assistant entry (which is omitted once nothing visible remains) and its result
+entry is omitted; a dropped result has its content replaced by the bounded head
+and note. Raw history, the TUI and exports keep everything; only the model
+context shrinks. Each run also appends a `custom` entry
+(`customType: "fast-jev-compaction"`) with the stats and per-call decisions.
+
+Below `minReductionRatio`, without a key, or when Jev fails, nothing is edited
+and Pi's built-in summary compaction (at `contextWindow - reserveTokens`) stays
+the fallback. After a run the extension waits until the context grows by
+another 10% of the window, or drops back below the threshold, before asking
+Jev again.
+
+```sh
+pi install /path/to/fast-jev-compaction   # or: pi -e /path/to/fast-jev-compaction
+```
+
+The key comes from `TYPESAFE_API_KEY` in Pi's environment. The plugin options
+are read from `FAST_JEV_*` variables: `FAST_JEV_COMPACT_AT_PERCENT`,
+`FAST_JEV_MIN_REDUCTION_RATIO`, `FAST_JEV_KEEP_THRESHOLD`,
+`FAST_JEV_PRESERVE_RECENT_MESSAGES`, `FAST_JEV_MAX_STATE_TOKENS`,
+`FAST_JEV_MAX_REQUEST_TOKENS`, `FAST_JEV_TRUNCATE_HEAD_CHARS`, `FAST_JEV_MODEL`
+and `FAST_JEV_GOAL`, with the defaults of [Options](#options) plus
+`compactAtPercent` 60 and `minReductionRatio` 0.25. In the TUI each run shows
+a `fast-jev: …` notification.
+
 ## Development
 
 ```sh
 npm install
-npm run typecheck        # library + hook
+npm run typecheck        # library + hook + Pi extension
 npm test
 npm run build
 npm run validate:plugin  # claude plugin validate
