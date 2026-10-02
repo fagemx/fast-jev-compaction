@@ -293,4 +293,18 @@ describe('the Pi extension on /compact and automatic compaction', () => {
     expect(result?.compaction).toBeDefined();
     expect(ext.notes[0]).toMatch(/context ~366k → ~\d+k tokens/);
   });
+
+  it("says so when the context is already past the window Pi assumes", async () => {
+    // Jev cuts little (only a.ts) from a 300k context Pi thinks cannot exceed 272k.
+    const ext = load(env, asker({ t1: { call: 0.1, result: 0.1 } }), 272_000);
+    expect(await ext.compact('manual', preparation({ tokensBefore: 300_000 }))).toBeUndefined();
+    expect(ext.notes[0]).toMatch(
+      /Pi summarizes instead\. The context \(~300k tokens\) is already past Pi's ~272k window for this model, so that window looks too small; see "When Pi's context window is wrong" in the README$/,
+    );
+
+    // Within the window, the plain reason is enough.
+    const fits = load(env, asker({ t1: { call: 0.1, result: 0.1 } }));
+    expect(await fits.compact('manual', preparation({ tokensBefore: 90_000 }))).toBeUndefined();
+    expect(fits.notes[0]).toMatch(/Pi summarizes instead$/);
+  });
 });

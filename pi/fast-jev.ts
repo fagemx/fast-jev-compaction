@@ -657,9 +657,17 @@ export function createFastJev(
         const window = ctx.model?.contextWindow ?? ctx.getContextUsage()?.contextWindow;
         const threshold = window ? window - preparation.settings.reserveTokens : 0;
         if (threshold > 0 && after > threshold * settings.compactTarget) {
+          // A context larger than the window means the provider serves more
+          // than Pi assumes; the threshold is then too low, not Jev's cuts.
+          const hint =
+            window && preparation.tokensBefore > window
+              ? `. The context (${tokenCount(preparation.tokensBefore)}) is already past Pi's ` +
+                `${thousands(window)} window for this model, so that window looks too small; ` +
+                `see "When Pi's context window is wrong" in the README`
+              : '';
           notify(
             `${what}: Jev's cuts would leave ${tokenCount(after)}, over ${percent(settings.compactTarget)} of ` +
-              `Pi's ${thousands(threshold)} compaction threshold; Pi summarizes instead`,
+              `Pi's ${thousands(threshold)} compaction threshold; Pi summarizes instead${hint}`,
           );
           return;
         }
