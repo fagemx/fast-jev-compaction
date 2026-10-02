@@ -1,9 +1,17 @@
 # fast-jev-compaction
 
-Claude Code plugin that replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library.
+Context compaction that keeps history verbatim: every tool call and result is
+scored by Jev in one fast request, stale ones are cut, everything kept stays
+word for word. Ships as a [Pi extension](#pi-extension), a
+[Claude Code plugin](#claude-code-plugin) and an npm library.
+
+> This is the maintained fork at
+> [fagemx/fast-jev-compaction](https://github.com/fagemx/fast-jev-compaction) of
+> [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction).
+> On top of upstream it adds the Pi extension, redacts secrets from every Jev
+> request, cuts text on code point boundaries, rejects malformed Jev
+> probabilities and estimates dense tokens better; several of these come from
+> open upstream pull requests, credited in the commits.
 
 ## What and why
 
@@ -14,9 +22,9 @@ calls and tool results Jev says are no longer needed, and it asks Jev while
 showing it the whole conversation. User and assistant text stays verbatim and
 in order.
 
-The repository is both an npm package (`src/`) and a Claude Code plugin
-(`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
-built-in compaction summary with the original messages.
+The repository is an npm package (`src/`), a Claude Code plugin (`hooks/`,
+`.claude-plugin/`) and a Pi package (`pi/`); both hosts use the package in
+place of their built-in compaction summary.
 
 ## How it works
 
@@ -58,10 +66,17 @@ fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
 
 ## Install and usage
 
+Build the library from this repository:
+
 ```sh
-npm install fast-jev-compaction
+git clone https://github.com/fagemx/fast-jev-compaction
+cd fast-jev-compaction && npm install && npm run build
+cd /your/project && npm install /path/to/fast-jev-compaction
 export TYPESAFE_API_KEY=...
 ```
+
+The `fast-jev-compaction` package on npm is published by a third party, not
+from this repository or from upstream.
 
 ```ts
 import { compactMessages, reductionRatio, type Message } from 'fast-jev-compaction';
@@ -150,7 +165,7 @@ Then add this repository as a plugin marketplace and install the plugin,
 either from the shell or as slash commands inside a session:
 
 ```sh
-claude plugin marketplace add tamaratran/fast-jev-compaction
+claude plugin marketplace add fagemx/fast-jev-compaction
 claude plugin install fast-jev-compaction@fast-jev-compaction
 ```
 
@@ -168,60 +183,116 @@ just the repo's `.claude-plugin/marketplace.json`.
 
 ## Pi extension
 
-The repository is also a [Pi](https://pi.dev) package: `pi/fast-jev.ts` runs
-the same library at the end of every turn whose context is at or above
-`compactAtPercent`. Pi has no message-list replacement, so the result lands as
-Pi's own append-only `context_edit` entries. A dropped result has its content
-replaced by the bounded head and note. A dropped call is stubbed rather than
-deleted: the call stays in its assistant entry, with input strings longer than
-`truncateHeadChars` cut to their head and a note, and its result becomes the
-note alone (`[fast-jev-compaction truncated N chars of this tool result;
-re-run the tool if needed]`). The history thus keeps a call behind every
-report the assistant made, and the gap is marked inside a tool result rather
-than in the assistant's own words, which a model has been seen to imitate
-(#65, #123). Raw history, the TUI and exports keep everything; only the model
-context shrinks. Each run also appends a `custom` entry
-(`customType: "fast-jev-compaction"`) with the stats and per-call decisions.
+`pi/fast-jev.ts` makes [Pi](https://pi.dev) compact with Jev instead of an LLM
+summary. It needs Pi 0.87 or newer (the `context_edit` API); it is tested on
+Pi 1.0.
 
-After a run the extension waits until the context grows by another 10% of the
-window, or drops back below the threshold, before asking Jev again.
-
-When Pi compacts anyway (`/compact`, its own threshold at
-`contextWindow - reserveTokens`, or overflow recovery), the extension handles
-`session_before_compact` the same way instead of letting an LLM summarize: Jev
-scores the history Pi would summarize, with Pi's kept window as pinned context,
-and that history goes into the compaction entry verbatim (thinking left out),
-stale tool outputs cut to their note, after the previous summary and followed
-by the files it read and changed. No summarization model is called, so
-compaction takes about a second.
-
-Below `minReductionRatio`, when the verbatim history would exceed
-`FAST_JEV_SUMMARY_SHARE` (0.25) of the context window, without a key, or when
-Jev fails, nothing changes and Pi's own summary stays the fallback.
+### Install
 
 ```sh
-pi install /path/to/fast-jev-compaction   # or: pi -e /path/to/fast-jev-compaction
+pi install git:github.com/fagemx/fast-jev-compaction
 ```
 
-The key comes from `TYPESAFE_API_KEY` in Pi's environment. Jev is also served
-through OpenRouter's decisions endpoint (`typesafe/jev-1.13`): with
-`FAST_JEV_PROVIDER=openrouter` the extension asks there, with
-`OPENROUTER_API_KEY` or, when that is unset, Pi's own OpenRouter login.
-`FAST_JEV_BASE_URL` points at any other endpoint with the same protocol.
-Every Jev request ends after `FAST_JEV_TIMEOUT_MS` (15000) or when the turn is
-interrupted, so a stalled endpoint cannot hold Pi; the goal Jev scores against
-is taken from the user's own prompts only, not Pi's summaries, bash runs or
-other extensions' messages. As for every transport, credential-shaped text is
-redacted from the request before it leaves the machine.
+Update later with `pi update --extension git:github.com/fagemx/fast-jev-compaction`.
+To try a checkout for one run: `pi -e /path/to/fast-jev-compaction`.
 
-The plugin options
-are read from `FAST_JEV_*` variables: `FAST_JEV_COMPACT_AT_PERCENT`,
-`FAST_JEV_MIN_REDUCTION_RATIO`, `FAST_JEV_KEEP_THRESHOLD`,
-`FAST_JEV_PRESERVE_RECENT_MESSAGES`, `FAST_JEV_MAX_STATE_TOKENS`,
-`FAST_JEV_MAX_REQUEST_TOKENS`, `FAST_JEV_TRUNCATE_HEAD_CHARS`, `FAST_JEV_MODEL`
-and `FAST_JEV_GOAL`, with the defaults of [Options](#options) plus
-`compactAtPercent` 60 and `minReductionRatio` 0.25. In the TUI each run shows
-a `fast-jev: …` notification.
+### Give it Jev access
+
+The extension reads its key from the environment Pi starts in. A key set
+somewhere else, such as Claude Code's `settings.json`, is not visible to Pi.
+Pick one route:
+
+| Route | Set | Key used |
+| --- | --- | --- |
+| OpenRouter, recommended when Pi already uses OpenRouter | `FAST_JEV_PROVIDER=openrouter` | `OPENROUTER_API_KEY`, or Pi's own OpenRouter login when that is unset |
+| TypeSafe directly | `TYPESAFE_API_KEY=<your key>` | that key |
+
+Windows, in PowerShell (stored for your user; open a new terminal afterwards):
+
+```powershell
+[Environment]::SetEnvironmentVariable('FAST_JEV_PROVIDER', 'openrouter', 'User')
+# or
+[Environment]::SetEnvironmentVariable('TYPESAFE_API_KEY', '<your key>', 'User')
+```
+
+macOS or Linux, in `~/.zshrc` or `~/.bashrc`:
+
+```sh
+export FAST_JEV_PROVIDER=openrouter
+# or
+export TYPESAFE_API_KEY=<your key>
+```
+
+Check it from the terminal you start Pi in: `$env:FAST_JEV_PROVIDER` or
+`[bool]$env:TYPESAFE_API_KEY` in PowerShell, `echo $FAST_JEV_PROVIDER` or
+`echo ${TYPESAFE_API_KEY:+set}` in a POSIX shell. Without access the
+extension edits nothing and says so, for example
+`fast-jev: /compact: TYPESAFE_API_KEY is not set; Pi summarizes instead`.
+
+### What it does
+
+Two paths, neither of which asks an LLM for a summary.
+
+**While you work.** At the end of a turn whose context is at or above
+`FAST_JEV_COMPACT_AT_PERCENT` (60%), Jev decides which older tool calls and
+results still matter, and the rest shrink through Pi's append-only
+`context_edit` entries. A dropped result keeps its first
+`FAST_JEV_TRUNCATE_HEAD_CHARS` characters and a note. A dropped call is
+stubbed rather than deleted: it stays in its assistant entry, long input
+strings cut to their head, and its result becomes the note alone
+(`[fast-jev-compaction truncated N chars of this tool result; re-run the tool
+if needed]`). The history keeps a call behind every report the assistant made,
+and the gap is marked inside a tool result, not in the assistant's own words,
+which a model has been seen to imitate (#65, #123). The next run waits until
+the context grows by another 10% of the window, or drops below the threshold.
+
+**When Pi compacts** (`/compact`, its own threshold at
+`contextWindow - reserveTokens`, or overflow recovery). Jev scores the history
+Pi would summarize, with Pi's kept window as pinned context, and that history
+goes into the compaction entry verbatim (thinking left out), stale tool
+outputs cut the same way, after the previous summary and followed by the files
+it read and changed. `/compact <instructions>` leads the goal Jev scores
+against. No summarization model is called, so compaction takes about a second.
+
+Raw history, the TUI and exports keep everything; only the model context
+shrinks. Each turn-end run appends a `custom` entry
+(`customType: "fast-jev-compaction"`) with its stats and per-call decisions, and
+a compaction keeps them in its `details.fastJev`. In the TUI each run shows a
+notification such as `fast-jev: 3 context edits, no summary (…)` or
+`fast-jev: /compact by Jev, no LLM summary (…)`.
+
+Pi's own summary stays the fallback, and the notification says why, when:
+
+- Jev cannot remove `FAST_JEV_MIN_REDUCTION_RATIO` (25%) of the history,
+- the verbatim history would take more than `FAST_JEV_SUMMARY_SHARE` (25%) of
+  the context window (compaction only),
+- there is no key, Jev fails, or it gives no answer within
+  `FAST_JEV_TIMEOUT_MS`; an interrupted turn stops the request too.
+
+Whichever route is used, credential-shaped text is redacted from every Jev
+request before it leaves the machine, and the goal Jev scores against comes
+from your own prompts, not Pi's summaries, bash runs or other extensions'
+messages.
+
+### Options
+
+All are environment variables, read when Pi starts.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FAST_JEV_PROVIDER` | `typesafe` | `typesafe` or `openrouter` |
+| `FAST_JEV_BASE_URL` | the provider's | Any other endpoint that speaks the Jev protocol |
+| `FAST_JEV_MODEL` | `jev-latest`; `typesafe/jev-1.13` on OpenRouter | Jev model name |
+| `FAST_JEV_TIMEOUT_MS` | `15000` | Deadline for one Jev request |
+| `FAST_JEV_COMPACT_AT_PERCENT` | `60` | Context percentage at which turn-end compaction runs |
+| `FAST_JEV_MIN_REDUCTION_RATIO` | `0.25` | Least share of characters a run must remove |
+| `FAST_JEV_SUMMARY_SHARE` | `0.25` | Largest share of the window a verbatim compaction may take |
+| `FAST_JEV_KEEP_THRESHOLD` | `0.5` | Least keep probability for a call or result to stay |
+| `FAST_JEV_PRESERVE_RECENT_MESSAGES` | `6` at turn end; Pi's kept window when compacting | Newest messages never touched |
+| `FAST_JEV_TRUNCATE_HEAD_CHARS` | `300` | Characters a truncated result or input keeps |
+| `FAST_JEV_MAX_STATE_TOKENS` | `25000` | Estimated token ceiling for the state sent to Jev |
+| `FAST_JEV_MAX_REQUEST_TOKENS` | `30000` | Estimated ceiling for state plus one batch of questions |
+| `FAST_JEV_GOAL` | your last 3 prompts | Task description Jev scores against |
 
 ## Development
 
