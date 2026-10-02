@@ -167,10 +167,15 @@ just the repo's `.claude-plugin/marketplace.json`.
 The repository is also a [Pi](https://pi.dev) package: `pi/fast-jev.ts` runs
 the same library at the end of every turn whose context is at or above
 `compactAtPercent`. Pi has no message-list replacement, so the result lands as
-Pi's own append-only `context_edit` entries: a dropped call is removed from its
-assistant entry (which is omitted once nothing visible remains) and its result
-entry is omitted; a dropped result has its content replaced by the bounded head
-and note. Raw history, the TUI and exports keep everything; only the model
+Pi's own append-only `context_edit` entries. A dropped result has its content
+replaced by the bounded head and note. A dropped call is stubbed rather than
+deleted: the call stays in its assistant entry, with input strings longer than
+`truncateHeadChars` cut to their head and a note, and its result becomes the
+note alone (`[fast-jev-compaction truncated N chars of this tool result;
+re-run the tool if needed]`). The history thus keeps a call behind every
+report the assistant made, and the gap is marked inside a tool result rather
+than in the assistant's own words, which a model has been seen to imitate
+(#65, #123). Raw history, the TUI and exports keep everything; only the model
 context shrinks. Each run also appends a `custom` entry
 (`customType: "fast-jev-compaction"`) with the stats and per-call decisions.
 

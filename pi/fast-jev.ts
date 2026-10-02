@@ -5,9 +5,9 @@ import type {
   ProjectedSessionEntry,
 } from '@earendil-works/pi-coding-agent';
 
-import { resolveHookConfig, summarize, type HookConfig } from '../hooks/fast-jev.js';
+import { resolveHookConfig, type HookConfig } from '../hooks/fast-jev.js';
 import { JevClient } from '../src/client.js';
-import { compact, reductionRatio } from '../src/compact.js';
+import { compact, resolveOptions, truncatedResultText } from '../src/compact.js';
 import type { CompactResult, JevAsker, Message, ToolUse } from '../src/types.js';
 
 /** `customType` of the session entry recording each run's stats and decisions. */
@@ -85,8 +85,8 @@ export interface PiTranscript {
   messages: Message[];
   /** Entry holding each tool call, by tool call id. */
   callEntries: Map<string, string>;
-  /** Entry and text of each tool result, by tool call id. */
-  results: Map<string, { entryId: string; text: string }>;
+  /** Entry and outcome of each tool result, by tool call id. */
+  results: Map<string, { entryId: string; text: string; isError: boolean }>;
   /** The projected assistant message of each entry holding tool calls. */
   assistants: Map<string, AssistantMessage>;
 }
@@ -114,7 +114,11 @@ export function toTranscript(entries: readonly ProjectedSessionEntry[]): PiTrans
         }
         const text = contentText(message.content);
         resultRun.toolResults!.push({ tool_use_id: message.toolCallId, text, isError: message.isError });
-        transcript.results.set(message.toolCallId, { entryId: sourceEntry.id, text });
+        transcript.results.set(message.toolCallId, {
+          entryId: sourceEntry.id,
+          text,
+          isError: message.isError,
+        });
         continue;
       }
       resultRun = undefined;
@@ -136,58 +140,84 @@ export function toTranscript(entries: readonly ProjectedSessionEntry[]): PiTrans
 }
 
 /**
- * Turns the library's compacted transcript into Pi context edits: a dropped
- * call leaves its assistant entry (omitted once nothing visible remains) and
- * its result entry is omitted; a truncated result replaces its entry's content.
+ * Cuts every long string in a stubbed call's input to its head and a note.
+ * Strings up to `headChars + 60` stay, so an abridged input is left as it is
+ * when compaction runs again.
+ */
+export function abridgeInput(value: unknown, headChars: number): unknown {
+  if (typeof value === 'string') {
+    if (value.length <= headChars + 60) return value;
+    return `${value.slice(0, headChars)}…[fast-jev-compaction truncated ${value.length - headChars} chars]`;
+  }
+  if (Array.isArray(value)) return value.map((item) => abridgeInput(item, headChars));
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, abridgeInput(item, headChars)]),
+    );
+  }
+  return value;
+}
+
+export type PiEdits = {
+  edits: ContextEditEntryDraft[];
+  /** Characters of tool input and tool output the edits take out. */
+  charsSaved: number;
+};
+
+/**
+ * Turns the library's compacted transcript into Pi context edits. A dropped
+ * result keeps the head and note the library gave it. A dropped call is not
+ * deleted but stubbed: it stays in its assistant entry with long input
+ * strings abridged, and its result is replaced by the library's note alone,
+ * which marks the gap. The history keeps a call behind every report, and the
+ * marker sits in a tool result, never in the assistant's own words, which a
+ * model has been seen to imitate (upstream #65).
  */
 export function contextEdits(
   transcript: PiTranscript,
   compacted: readonly Message[],
-): ContextEditEntryDraft[] {
+  headChars: number,
+): PiEdits {
   const keptCalls = new Set<string>();
   const keptResults = new Map<string, string>();
   for (const message of compacted) {
     for (const tool of message.toolUses) keptCalls.add(tool.tool_use_id);
     for (const result of message.toolResults ?? []) keptResults.set(result.tool_use_id, result.text);
   }
+  const dropped = (id: string) => transcript.callEntries.has(id) && !keptCalls.has(id);
 
   const edits: ContextEditEntryDraft[] = [];
-  const droppedByEntry = new Map<string, Set<string>>();
-  for (const [id, entryId] of transcript.callEntries) {
-    if (keptCalls.has(id)) continue;
-    const dropped = droppedByEntry.get(entryId) ?? new Set<string>();
-    dropped.add(id);
-    droppedByEntry.set(entryId, dropped);
+  let charsSaved = 0;
+  for (const [entryId, message] of transcript.assistants) {
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (block.type !== 'toolCall' || !dropped(block.id)) return block;
+      const args = abridgeInput(block.arguments, headChars) as typeof block.arguments;
+      const saved = JSON.stringify(block.arguments).length - JSON.stringify(args).length;
+      if (saved <= 0) return block;
+      changed = true;
+      charsSaved += saved;
+      return { ...block, arguments: args };
+    });
+    if (changed) edits.push({ type: 'context_edit', targetId: entryId, replacement: { content } });
   }
-  for (const [entryId, dropped] of droppedByEntry) {
-    const content = transcript.assistants
-      .get(entryId)!
-      .content.filter((block) => !(block.type === 'toolCall' && dropped.has(block.id)));
-    const visible = content.some(
-      (block) => block.type === 'toolCall' || (block.type === 'text' && block.text.trim() !== ''),
-    );
-    edits.push({ type: 'context_edit', targetId: entryId, replacement: visible ? { content } : null });
+  for (const [id, { entryId, text, isError }] of transcript.results) {
+    const next = dropped(id) ? truncatedResultText(text, isError, 0) : keptResults.get(id);
+    if (next === undefined || next === text) continue;
+    charsSaved += text.length - next.length;
+    edits.push({
+      type: 'context_edit',
+      targetId: entryId,
+      replacement: { content: [{ type: 'text', text: next }] },
+    });
   }
-  for (const [id, { entryId, text }] of transcript.results) {
-    if (transcript.callEntries.has(id) && !keptCalls.has(id)) {
-      edits.push({ type: 'context_edit', targetId: entryId, replacement: null });
-      continue;
-    }
-    const kept = keptResults.get(id);
-    if (kept !== undefined && kept !== text) {
-      edits.push({
-        type: 'context_edit',
-        targetId: entryId,
-        replacement: { content: [{ type: 'text', text: kept }] },
-      });
-    }
-  }
-  return edits;
+  return { edits, charsSaved };
 }
 
-export type PiCompaction = {
+export type PiCompaction = PiEdits & {
   result: CompactResult;
-  edits: ContextEditEntryDraft[];
+  /** Share of the transcript's characters the edits take out. */
+  ratio: number;
 };
 
 /** Runs the library over Pi's projected context; throws when Jev fails. */
@@ -198,18 +228,37 @@ export async function compactEntries(
 ): Promise<PiCompaction> {
   const transcript = toTranscript(entries);
   const result = await compact(transcript.messages, asker, config);
-  return { result, edits: contextEdits(transcript, result.messages) };
+  const { edits, charsSaved } = contextEdits(
+    transcript,
+    result.messages,
+    resolveOptions(config).truncateHeadChars,
+  );
+  const { charsBefore } = result.stats;
+  return { result, edits, charsSaved, ratio: charsBefore === 0 ? 0 : charsSaved / charsBefore };
 }
 
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
+/** One line on a run, for the TUI notification. */
+export function describeRun({ result, ratio }: Pick<PiCompaction, 'result' | 'ratio'>): string {
+  const { stats } = result;
+  const parts = [
+    stats.kept > 0 ? `${stats.kept} kept` : '',
+    stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
+    stats.callsDropped > 0 ? `${stats.callsDropped} calls stubbed` : '',
+    stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+  ].filter(Boolean);
+  return `${percent(ratio)} reduction; ${parts.join(', ') || 'no tool calls'}; ${stats.requests} Jev request(s) in ${stats.ms} ms`;
+}
+
 /**
  * The Pi extension. At the end of a turn whose context is at or above
  * `compactAtPercent`, Jev decides which older tool calls and results still
- * matter, and the rest leave the model context through append-only
- * `context_edit` entries: verbatim, no summary. Below `minReductionRatio`, or
+ * matter, and the rest shrink in the model context through append-only
+ * `context_edit` entries (see `contextEdits`); everything kept stays
+ * verbatim, no summary. Below `minReductionRatio`, or
  * when Jev fails, nothing changes and Pi's own summary compaction stays the
  * fallback. A run is retried only after the context grows by another 10% of
  * the window, or after it drops below the threshold.
@@ -246,21 +295,21 @@ export function createFastJev(
         return;
       }
       try {
-        const { result, edits } = await compactEntries(
-          event.context.contextEntries,
-          config,
-          askerFor(config),
-        );
+        const run = await compactEntries(event.context.contextEntries, config, askerFor(config));
+        const { stats, decisions } = run.result;
+        // Stubs keep every message; only characters leave the context.
+        const charsAfter = stats.charsBefore - run.charsSaved;
         const record: CustomEntryDraft = {
           type: 'custom',
           customType: CUSTOM_TYPE,
-          data: { stats: result.stats, decisions: result.decisions },
+          data: { stats: { ...stats, messagesAfter: stats.messagesBefore, charsAfter }, decisions },
         };
-        if (edits.length === 0 || reductionRatio(result) < config.minReductionRatio) {
-          notify(`below the ${percent(config.minReductionRatio)} minimum, no edits (${summarize(result)})`);
+        const { edits } = run;
+        if (edits.length === 0 || run.ratio < config.minReductionRatio) {
+          notify(`below the ${percent(config.minReductionRatio)} minimum, no edits (${describeRun(run)})`);
           return { entries: [...event.entries, record] };
         }
-        notify(`${edits.length} context edits, no summary (${summarize(result)})`);
+        notify(`${edits.length} context edits, no summary (${describeRun(run)})`);
         return { entries: [...event.entries, ...edits, record] };
       } catch (error) {
         notify(

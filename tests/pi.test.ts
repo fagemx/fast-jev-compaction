@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
+  ContextEditEntryDraft,
   ExtensionAPI,
   ExtensionContext,
   ProjectedSessionEntry,
@@ -7,6 +8,7 @@ import type {
   TurnEndEventResult,
 } from '@earendil-works/pi-coding-agent';
 import {
+  abridgeInput,
   compactEntries,
   contextEdits,
   createFastJev,
@@ -113,7 +115,7 @@ describe('toTranscript', () => {
       ['c1', 'a1'],
       ['c2', 'a1'],
     ]);
-    expect(transcript.results.get('c2')).toEqual({ entryId: 'r2', text: 'B' });
+    expect(transcript.results.get('c2')).toEqual({ entryId: 'r2', text: 'B', isError: false });
   });
 
   it('gives summaries, bash runs and unknown roles a user text', () => {
@@ -126,36 +128,104 @@ describe('toTranscript', () => {
   });
 });
 
+/** The projection Pi rebuilds after the edits: each target's content replaced. */
+function applyEdits(entries: ProjectedSessionEntry[], edits: readonly ContextEditEntryDraft[]): ProjectedSessionEntry[] {
+  return entries.map((entry) => {
+    const edit = edits.findLast((e) => e.targetId === entry.sourceEntry.id);
+    if (!edit) return entry;
+    if (!edit.replacement) return { ...entry, messages: [] };
+    const content = edit.replacement.content;
+    return { ...entry, messages: entry.messages.map((m) => ({ ...m, content }) as AgentMessage) };
+  });
+}
+
+const textOf = (edit: ContextEditEntryDraft | undefined) =>
+  (edit?.replacement?.content as { type: 'text'; text: string }[])[0]!.text;
+
+const dropEverything = { t1: { call: 0.1, result: 0.1 }, t2: { call: 0.1, result: 0.1 }, t3: { call: 0.1, result: 0.1 } };
+
 describe('compactEntries', () => {
-  it('omits dropped calls and their results, truncates dropped results, and leaves kept calls alone', async () => {
+  it('truncates dropped results and stubs dropped calls behind a marker result', async () => {
     const config = { ...resolveHookConfig({}), preserveRecentMessages: 0 };
-    const { result, edits } = await compactEntries(
+    const run = await compactEntries(
       session(),
       config,
       asker({ t1: { call: 0.9, result: 0.1 }, t2: { call: 0.9, result: 0.9 }, t3: { call: 0.1, result: 0.1 } }),
     );
-    expect(result.decisions.map((d) => d.action)).toEqual(['drop_result', 'keep', 'drop_call']);
-    expect(edits).toHaveLength(3);
-    expect(edits).toContainEqual({ type: 'context_edit', targetId: 'a3', replacement: null });
-    expect(edits).toContainEqual({ type: 'context_edit', targetId: 'r3', replacement: null });
-    const truncated = edits.find((edit) => edit.targetId === 'r1');
-    const text = (truncated?.replacement?.content as { type: 'text'; text: string }[])[0]!.text;
-    expect(text.startsWith(fileA.slice(0, 300))).toBe(true);
-    expect(text).toContain('[fast-jev-compaction truncated');
+    expect(run.result.decisions.map((d) => d.action)).toEqual(['drop_result', 'keep', 'drop_call']);
+    expect(run.edits.map((edit) => edit.targetId)).toEqual(['r1', 'r3']);
+    expect(run.edits.every((edit) => edit.replacement !== null)).toBe(true);
+    const truncated = textOf(run.edits[0]);
+    expect(truncated.startsWith(fileA.slice(0, 300))).toBe(true);
+    expect(truncated).toContain('[fast-jev-compaction truncated 700 chars');
+    expect(textOf(run.edits[1])).toBe(
+      '[fast-jev-compaction truncated 1000 chars of this tool result; re-run the tool if needed]',
+    );
+    expect(run.charsSaved).toBe(1000 - truncated.length + 1000 - textOf(run.edits[1]).length);
+    expect(run.ratio).toBeCloseTo(run.charsSaved / run.result.stats.charsBefore);
   });
 
-  it('keeps the visible rest of an assistant entry whose call is dropped', async () => {
+  it('abridges the long input of a stubbed call and keeps the rest of its entry', async () => {
     const config = { ...resolveHookConfig({}), preserveRecentMessages: 0 };
-    const { edits } = await compactEntries(session(), config, asker({ t1: { call: 0.1, result: 0.1 } }));
+    const entries = [
+      user('u1', 'Write c.ts.'),
+      assistant('w1', [
+        { type: 'thinking', thinking: 'write it' },
+        { type: 'text', text: 'Writing.' },
+        toolCall('c9', 'write', { path: 'src/c.ts', content: fileA }),
+      ]),
+      toolResult('rw', 'c9', 'Wrote 1000 bytes'),
+      assistant('a4', [{ type: 'text', text: 'Done.' }]),
+    ];
+    const { edits } = await compactEntries(entries, config, asker(dropEverything));
     expect(edits).toEqual([
-      { type: 'context_edit', targetId: 'a1', replacement: { content: [{ type: 'text', text: 'Reading.' }] } },
-      { type: 'context_edit', targetId: 'r1', replacement: null },
+      {
+        type: 'context_edit',
+        targetId: 'w1',
+        replacement: {
+          content: [
+            { type: 'thinking', thinking: 'write it' },
+            { type: 'text', text: 'Writing.' },
+            toolCall('c9', 'write', {
+              path: 'src/c.ts',
+              content: `${fileA.slice(0, 300)}…[fast-jev-compaction truncated 700 chars]`,
+            }),
+          ],
+        },
+      },
     ]);
+  });
+
+  it('leaves its own output unchanged when compaction runs again', async () => {
+    const config = { ...resolveHookConfig({}), preserveRecentMessages: 0 };
+    const entries = [
+      ...session(),
+      assistant('w1', [toolCall('c9', 'write', { path: 'src/c.ts', content: fileA })]),
+      toolResult('rw', 'c9', fileB),
+    ];
+    const first = await compactEntries(entries, config, asker({ ...dropEverything, t4: { call: 0.1, result: 0.1 } }));
+    expect(first.edits.length).toBeGreaterThan(0);
+    const second = await compactEntries(
+      applyEdits(entries, first.edits),
+      config,
+      asker({ ...dropEverything, t4: { call: 0.1, result: 0.1 } }),
+    );
+    expect(second.edits).toEqual([]);
   });
 
   it('makes no edits when everything is kept', () => {
     const transcript = toTranscript(session());
-    expect(contextEdits(transcript, transcript.messages)).toEqual([]);
+    expect(contextEdits(transcript, transcript.messages, 300)).toEqual({ edits: [], charsSaved: 0 });
+  });
+
+  it('cuts only long strings, at any depth', () => {
+    const long = 'x'.repeat(500);
+    expect(abridgeInput({ a: 'short', b: [long, { c: long }], n: 3, z: null }, 10)).toEqual({
+      a: 'short',
+      b: ['xxxxxxxxxx…[fast-jev-compaction truncated 490 chars]', { c: 'xxxxxxxxxx…[fast-jev-compaction truncated 490 chars]' }],
+      n: 3,
+      z: null,
+    });
   });
 });
 
@@ -210,16 +280,17 @@ describe('the Pi extension', () => {
   }
 
   const env = { TYPESAFE_API_KEY: 'k', FAST_JEV_PRESERVE_RECENT_MESSAGES: '0' };
-  const dropAll = asker({ t1: { call: 0.1, result: 0.1 }, t2: { call: 0.1, result: 0.1 }, t3: { call: 0.1, result: 0.1 } });
+  const dropAll = asker(dropEverything);
 
   it('appends context edits and a record after the earlier proposed entries', async () => {
     const ext = load(env, dropAll);
     expect(await ext.turnEnd(59)).toBeUndefined();
     const result = await ext.turnEnd(60);
     expect(result?.entries?.[0]).toEqual({ type: 'custom', customType: 'other' });
-    expect(result?.entries?.filter((e) => e.type === 'context_edit')).toHaveLength(6);
+    expect(result?.entries?.filter((e) => e.type === 'context_edit')).toHaveLength(2);
     expect(result?.entries?.at(-1)).toMatchObject({ type: 'custom', customType: CUSTOM_TYPE });
-    expect(ext.notes[0]).toMatch(/^fast-jev: 6 context edits, no summary/);
+    expect(ext.notes[0]).toMatch(/^fast-jev: 2 context edits, no summary \(\d+% reduction; 3 calls stubbed;/);
+    expect(result?.entries?.at(-1)).toMatchObject({ data: { stats: { messagesAfter: 9 } } });
   });
 
   it('waits for another 10% of the window, or a drop below the threshold, before running again', async () => {
