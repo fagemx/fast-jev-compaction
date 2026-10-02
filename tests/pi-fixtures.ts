@@ -80,15 +80,23 @@ export const dropEverything = {
 type Handler = (event: never, ctx: ExtensionContext) => unknown;
 
 /** A Pi stand-in that keeps the handlers an extension registers, by event. */
-export function fakePi(): { pi: ExtensionAPI; handlers: Map<string, Handler> } {
+export function fakePi(): {
+  pi: ExtensionAPI;
+  handlers: Map<string, Handler>;
+  registered: Array<{ name: string; models: unknown[] }>;
+} {
   const handlers = new Map<string, Handler>();
+  const registered: Array<{ name: string; models: unknown[] }> = [];
   const pi = {
     on(event: string, handler: Handler) {
       handlers.set(event, handler);
       return () => {};
     },
+    registerProvider(name: string, config: { models: unknown[] }) {
+      registered.push({ name, models: config.models });
+    },
   } as unknown as ExtensionAPI;
-  return { pi, handlers };
+  return { pi, handlers, registered };
 }
 
 /** An extension context over a projected session, recording notifications. */
@@ -98,6 +106,7 @@ export function fakeContext(options: {
   contextWindow?: number;
   entries?: ProjectedSessionEntry[];
   piKeys?: Record<string, string>;
+  providers?: Record<string, Array<{ id: string; contextWindow?: number }>>;
 }): ExtensionContext {
   const contextWindow = options.contextWindow ?? 100_000;
   const percent = options.percent ?? 0;
@@ -105,7 +114,13 @@ export function fakeContext(options: {
     hasUI: true,
     ui: { notify: (message) => void options.notes.push(message) },
     signal: undefined,
-    modelRegistry: { getApiKeyForProvider: async (provider) => options.piKeys?.[provider] },
+    modelRegistry: {
+      getApiKeyForProvider: async (provider) => options.piKeys?.[provider],
+      getProvider: (provider) => {
+        const models = options.providers?.[provider];
+        return models ? { getAllModels: () => models } : undefined;
+      },
+    },
     model: { contextWindow },
     sessionManager: { buildSessionProjection: () => ({ entries: options.entries ?? session() }) },
     getContextUsage: () => ({ tokens: (percent / 100) * contextWindow, contextWindow, percent }),

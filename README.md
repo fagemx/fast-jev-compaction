@@ -287,33 +287,43 @@ messages.
 
 The extension sizes its decisions by Pi's own numbers: turn-end runs start at
 a share of the model's context window, and a compaction must leave room under
-Pi's compaction threshold (the window minus `reserveTokens`). Some built-in
-models are listed with a smaller window than the provider serves; Pi lists
-openai-codex's gpt-6 models at 272k, yet requests past 277k tokens succeed.
-Set the window your provider actually serves in `~/.pi/agent/models.json`:
+Pi's compaction threshold (the window minus `reserveTokens`). Pi lists
+openai-codex's gpt-6 models at 272k, while the ChatGPT backend serves them
+with 1M (requests of ~750k tokens go through), so the extension corrects
+them when a session starts: it re-registers the openai-codex models with that
+one value changed, and Pi keeps its own login and streaming for them. Pi's
+percentage, its compaction point and the extension's decisions then all use
+1M, with nothing to configure. A model is only corrected while Pi still lists
+it at 272k, so a `models.json` override or a fixed Pi catalog wins, and
+`FAST_JEV_FIX_WINDOWS=0` turns the correction off. `pi --list-models` loads no
+extensions and still shows Pi's own value.
+
+For another model Pi lists too small, set the window your provider serves in
+`~/.pi/agent/models.json`:
 
 ```json
 {
   "providers": {
-    "openai-codex": {
+    "some-provider": {
       "modelOverrides": {
-        "gpt-6-astra": { "contextWindow": 1000000 }
+        "some-model": { "contextWindow": 1000000 }
       }
     }
   }
 }
 ```
 
-To have Pi compact before the very edge, raise the reserve for that model in
-`~/.pi/agent/settings.json`; with a 1M window, 100k compacts at 900k:
+To have Pi compact earlier than the window minus 16k, raise the reserve for
+that model in `~/.pi/agent/settings.json`; on a 1M window, 100k compacts at
+900k:
 
 ```json
 { "compaction": { "modelOverrides": { "openai-codex/gpt-6-astra": { "reserveTokens": 100000 } } } }
 ```
 
-`pi --list-models` shows the window Pi uses. On a 1M window the default
-`FAST_JEV_COMPACT_AT_PERCENT` of 60 starts turn-end runs at 600k tokens; a
-lower value such as 30 trims stale tool output sooner.
+On a 1M window the default `FAST_JEV_COMPACT_AT_PERCENT` of 60 starts
+turn-end runs at 600k tokens; a lower value such as 30 trims stale tool output
+sooner.
 
 ### Options
 
@@ -328,6 +338,7 @@ All are environment variables, read when Pi starts.
 | `FAST_JEV_COMPACT_AT_PERCENT` | `60` | Context percentage at which turn-end compaction runs |
 | `FAST_JEV_MIN_REDUCTION_RATIO` | `0.25` | Least share of characters a turn-end run must remove |
 | `FAST_JEV_COMPACT_TARGET` | `0.5` | Largest share of Pi's compaction threshold the context may take after a Jev compaction |
+| `FAST_JEV_FIX_WINDOWS` | on | Correct the context windows Pi lists too small; `0` turns it off |
 | `FAST_JEV_KEEP_THRESHOLD` | `0.5` | Least keep probability for a call or result to stay |
 | `FAST_JEV_PRESERVE_RECENT_MESSAGES` | `6` at turn end; Pi's kept window when compacting | Newest messages never touched |
 | `FAST_JEV_TRUNCATE_HEAD_CHARS` | `300` | Characters a truncated result or input keeps |

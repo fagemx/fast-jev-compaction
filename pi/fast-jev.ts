@@ -64,12 +64,15 @@ export interface PiSettings {
    * context may still take after a Jev compaction; above it Pi summarizes.
    */
   compactTarget: number;
+  /** Correct the built-in model windows Pi lists too small (`WINDOW_FIXES`). */
+  fixWindows: boolean;
 }
 
 /**
  * Settings from the environment: the plugin options from `FAST_JEV_*`
  * variables, `FAST_JEV_PROVIDER` (`typesafe` or `openrouter`),
- * `FAST_JEV_BASE_URL`, `FAST_JEV_TIMEOUT_MS` and `FAST_JEV_COMPACT_TARGET`. The key is
+ * `FAST_JEV_BASE_URL`, `FAST_JEV_TIMEOUT_MS`, `FAST_JEV_COMPACT_TARGET` and
+ * `FAST_JEV_FIX_WINDOWS`. The key is
  * `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` for OpenRouter (which also
  * defaults the model to `typesafe/jev-1.13`).
  */
@@ -95,6 +98,7 @@ export function piSettings(env: Readonly<Record<string, string | undefined>>): P
     provider,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 15_000,
     compactTarget: Number.isFinite(target) && target > 0 && target <= 1 ? target : 0.5,
+    fixWindows: !/^(0|false|off|no)$/i.test(env.FAST_JEV_FIX_WINDOWS?.trim() ?? ''),
   };
   const baseUrl = env.FAST_JEV_BASE_URL?.trim();
   if (baseUrl) settings.baseUrl = baseUrl;
@@ -487,6 +491,49 @@ export function describeRun({ result, ratio }: Pick<PiCompaction, 'result' | 'ra
   return `${percent(ratio)} reduction; ${parts.join(', ') || 'no tool calls'}; ${stats.requests} Jev request(s) in ${stats.ms} ms`;
 }
 
+/** A built-in model Pi lists with a smaller context window than its provider serves. */
+export interface WindowFix {
+  provider: string;
+  model: RegExp;
+  /** The window Pi lists. */
+  listed: number;
+  /** The window the provider serves. */
+  served: number;
+}
+
+/**
+ * Pi lists openai-codex's gpt-6 models at 272k, while the ChatGPT backend
+ * serves them with 1M (requests of ~750k tokens go through). A fix applies
+ * only while Pi still lists the model at `listed`, so a models.json override
+ * or a corrected Pi catalog wins.
+ */
+export const WINDOW_FIXES: readonly WindowFix[] = [
+  { provider: 'openai-codex', model: /^gpt-6(\.\d+)?-/, listed: 272_000, served: 1_000_000 },
+];
+
+/** The provider's models with the windows the fixes correct, or undefined when none needs it. */
+export function correctedModels<M extends { id: string; contextWindow?: number }>(
+  provider: string,
+  models: readonly M[],
+  fixes: readonly WindowFix[] = WINDOW_FIXES,
+): M[] | undefined {
+  let changed = false;
+  const corrected = models.map((model) => {
+    const fix = fixes.find(
+      (candidate) =>
+        candidate.provider === provider && candidate.model.test(model.id) && model.contextWindow === candidate.listed,
+    );
+    if (!fix) return model;
+    changed = true;
+    return { ...model, contextWindow: fix.served };
+  });
+  return changed ? corrected : undefined;
+}
+
+function windowLabel(tokens: number): string {
+  return tokens % 1_000_000 === 0 ? `${tokens / 1_000_000}M` : `${Math.round(tokens / 1000)}k`;
+}
+
 /** What one run asks Jev through. */
 export interface JevEndpoint {
   apiKey: string;
@@ -571,6 +618,27 @@ export function createFastJev(
         : error instanceof Error
           ? error.message
           : String(error);
+
+    // Pi sizes its own compaction, and this extension its decisions, by the
+    // model's window; correct the ones Pi lists too small before anything runs.
+    pi.on('session_start', (_event, ctx) => {
+      if (!settings.fixWindows) return;
+      for (const provider of new Set(WINDOW_FIXES.map((fix) => fix.provider))) {
+        const models = ctx.modelRegistry.getProvider(provider)?.getAllModels?.();
+        if (!models) continue;
+        const corrected = correctedModels(provider, models);
+        if (!corrected) continue;
+        // The full list: a registration replaces the provider's models, while
+        // Pi keeps the built-in provider's login and streaming.
+        pi.registerProvider(provider, { models: corrected });
+        const fixed = corrected.filter((model, index) => model !== models[index]).map((model) => model.id);
+        const fix = WINDOW_FIXES.find((candidate) => candidate.provider === provider && candidate.model.test(fixed[0]!))!;
+        notifier(ctx)(
+          `Pi lists ${provider} ${fixed.join(', ')} at ${windowLabel(fix.listed)}; using the ` +
+            `${windowLabel(fix.served)} window they are served with (FAST_JEV_FIX_WINDOWS=0 turns this off)`,
+        );
+      }
+    });
 
     pi.on('turn_end', async (event, ctx) => {
       const usage = ctx.getContextUsage();

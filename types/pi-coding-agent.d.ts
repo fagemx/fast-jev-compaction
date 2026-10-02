@@ -144,13 +144,22 @@ declare module '@earendil-works/pi-coding-agent' {
     ui: { notify(message: string, type?: 'info' | 'warning' | 'error'): void };
     /** The current abort signal, or undefined when the agent is not streaming. */
     signal: AbortSignal | undefined;
-    modelRegistry: { getApiKeyForProvider(provider: string): Promise<string | undefined> };
+    modelRegistry: {
+      getApiKeyForProvider(provider: string): Promise<string | undefined>;
+      getProvider(provider: string): { getAllModels?(): Array<{ id: string; contextWindow?: number }> } | undefined;
+    };
     model: { contextWindow: number } | undefined;
     sessionManager: { buildSessionProjection(): { entries: ProjectedSessionEntry[] } };
     getContextUsage(): ContextUsage | undefined;
   }
 
   export interface ExtensionAPI {
+    /** Register or override a model provider; `models` replaces its model list. */
+    registerProvider(name: string, config: { models: Array<{ id: string; contextWindow?: number }> }): void;
+    on(
+      event: 'session_start',
+      handler: (event: { type: 'session_start' }, ctx: ExtensionContext) => Promise<void> | void,
+    ): () => void;
     on(
       event: 'session_before_compact',
       handler: (
