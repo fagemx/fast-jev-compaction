@@ -101,6 +101,22 @@ describe('token estimate', () => {
     const json = JSON.stringify({ file_path: '/Users/x/src/a.ts', old_string: 'a = 1;', n: 42 });
     expect(estimateTokens(json)).toBeGreaterThanOrEqual(Math.ceil(json.length / 3));
   });
+
+  it('charges dense runs (hex, UUIDs, base64) at least ~3 chars per token (#81)', () => {
+    const blob = 'c3RhcnQgdGhlIGNvbXBhY3Rpb24gZnJvbSB0aGUgaG9vayBhbmQga2VlcCBpdCBydW5uaW5n';
+    expect(estimateTokens(blob)).toBeGreaterThanOrEqual(Math.ceil(blob.length / 3));
+    const uuid = '3f2504e0-4f89-41d3-9a0c-0305e82c3301';
+    expect(estimateTokens(uuid)).toBeGreaterThanOrEqual(Math.ceil(uuid.replace(/-/g, '').length / 3));
+    const sha = 'd41d8cd98f00b204e9800998ecf8427e';
+    expect(estimateTokens(sha)).toBeGreaterThanOrEqual(Math.ceil(sha.length / 3));
+    // prose and ordinary identifiers keep the word rate
+    expect(estimateTokens('internationalization')).toBe(4);
+    expect(estimateTokens('estimateTokens')).toBe(3);
+    expect(estimateTokens('12345678')).toBe(4);
+    expect(estimateTokens('utf8 base64')).toBeLessThan(6);
+    // repeated filler compresses well and stays on the word rate
+    expect(estimateTokens('x'.repeat(200))).toBe(34);
+  });
 });
 
 describe('tool call collection', () => {
@@ -330,6 +346,28 @@ describe('decisions', () => {
       `[fast-jev-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
     );
   });
+
+  it('never cuts the head of a dropped result inside a surrogate pair', () => {
+    const emoji = '\u{1F600}';
+    const note = (omitted: number): string =>
+      `[fast-jev-compaction truncated ${omitted} chars of this tool result; re-run the tool if needed]`;
+    const truncated = (text: string): string | undefined => {
+      const messages = transcript();
+      messages[1]!.toolUses[0]!.text = text;
+      messages[2]!.toolResults![0]!.text = text;
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+      const kept = applyDecisions(messages, decisions, calls, 300);
+      expect(kept[1]?.toolUses[0]?.text).toBe(kept[2]?.toolResults?.[0]?.text);
+      return kept[2]?.toolResults?.[0]?.text;
+    };
+
+    const straddling = `${'x'.repeat(299)}${emoji.repeat(200)}`;
+    expect(truncated(straddling)).toBe(`${'x'.repeat(299)}\n${note(straddling.length - 299)}`);
+
+    const aligned = `${'x'.repeat(298)}${emoji.repeat(200)}`;
+    expect(truncated(aligned)).toBe(`${'x'.repeat(298)}${emoji}\n${note(aligned.length - 300)}`);
+  });
 });
 
 describe('compact', () => {
@@ -385,6 +423,28 @@ describe('compact', () => {
     };
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
       /Invalid Jev answer/,
+    );
+  });
+
+  it.each([
+    ['call_t1', -0.1],
+    ['call_t1', 1.1],
+    ['result_t1', -0.1],
+    ['result_t1', 1.1],
+  ])('rejects an out-of-range probability for %s: %s', async (name, probability) => {
+    await expect(
+      compact(transcript(), fakeJev((key) => key === name ? probability : 0.5), {
+        preserveRecentMessages: 1,
+      }),
+    ).rejects.toThrow(`Invalid Jev answer for ${name}`);
+  });
+
+  it.each([0, 1])('accepts the boundary probability %s', async (probability) => {
+    const output = await compact(transcript(), fakeJev(() => probability), {
+      preserveRecentMessages: 1,
+    });
+    expect(output.decisions.map((decision) => decision.action)).toEqual(
+      Array(3).fill(probability === 0 ? 'drop_call' : 'keep'),
     );
   });
 });

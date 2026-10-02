@@ -8,6 +8,7 @@ import type {
 import { resolveHookConfig, type HookConfig } from '../hooks/fast-jev.js';
 import { JevClient } from '../src/client.js';
 import { compact, resolveOptions, truncatedResultText } from '../src/compact.js';
+import { headOf } from '../src/state.js';
 import type { CompactResult, JevAsker, Message, ToolUse } from '../src/types.js';
 
 /** `customType` of the session entry recording each run's stats and decisions. */
@@ -147,7 +148,8 @@ export function toTranscript(entries: readonly ProjectedSessionEntry[]): PiTrans
 export function abridgeInput(value: unknown, headChars: number): unknown {
   if (typeof value === 'string') {
     if (value.length <= headChars + 60) return value;
-    return `${value.slice(0, headChars)}…[fast-jev-compaction truncated ${value.length - headChars} chars]`;
+    const head = headOf(value, headChars);
+    return `${head}…[fast-jev-compaction truncated ${value.length - head.length} chars]`;
   }
   if (Array.isArray(value)) return value.map((item) => abridgeInput(item, headChars));
   if (value !== null && typeof value === 'object') {
