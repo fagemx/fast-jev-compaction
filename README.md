@@ -288,14 +288,16 @@ messages.
 The extension sizes its decisions by Pi's own numbers: turn-end runs start at
 a share of the model's context window, and a compaction must leave room under
 Pi's compaction threshold (the window minus `reserveTokens`). Pi lists
-openai-codex's gpt-6 models at 272k, while the ChatGPT backend serves them
-with 1M (requests of ~750k tokens go through), so the extension corrects
-them when a session starts: it re-registers the openai-codex models with that
+openai-codex's gpt-5.6 and gpt-6 models at 272k, while the ChatGPT backend
+serves them with 1M (measured: gpt-6-astra read a 461k-token prompt end to end,
+gpt-5.6-luna a 594k one), so the extension corrects them when a session
+starts: it re-registers the openai-codex models with that
 one value changed, and Pi keeps its own login and streaming for them. Pi's
 percentage, its compaction point and the extension's decisions then all use
 1M, with nothing to configure. A model is only corrected while Pi still lists
 it at 272k, so a `models.json` override or a fixed Pi catalog wins, and
-`FAST_JEV_FIX_WINDOWS=0` turns the correction off. `pi --list-models` loads no
+`FAST_JEV_FIX_WINDOWS=0` turns the correction off. gpt-5.5 keeps Pi's 272k: it
+rejects a 309k-token prompt as over its window. `pi --list-models` loads no
 extensions and still shows Pi's own value.
 
 For another model Pi lists too small, set the window your provider serves in

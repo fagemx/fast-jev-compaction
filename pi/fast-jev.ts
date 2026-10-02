@@ -502,12 +502,15 @@ export interface WindowFix {
 }
 
 /**
- * Pi lists openai-codex's gpt-6 models at 272k, while the ChatGPT backend
- * serves them with 1M (requests of ~750k tokens go through). A fix applies
- * only while Pi still lists the model at `listed`, so a models.json override
- * or a corrected Pi catalog wins.
+ * Pi lists openai-codex's gpt-5.6 and gpt-6 models at 272k, while the ChatGPT
+ * backend serves them with 1M: measured on 2026-10-03, gpt-6-astra took a
+ * 461k-token prompt and gpt-5.6-luna a 594k one (gpt-5.6-sol and -terra 309k),
+ * all read end to end. gpt-5.5 is not listed: it rejected 309k as over its
+ * window, so Pi's 272k is right for it. A fix applies only while Pi still lists
+ * the model at `listed`, so a models.json override or a corrected Pi catalog wins.
  */
 export const WINDOW_FIXES: readonly WindowFix[] = [
+  { provider: 'openai-codex', model: /^gpt-5\.6-/, listed: 272_000, served: 1_000_000 },
   { provider: 'openai-codex', model: /^gpt-6(\.\d+)?-/, listed: 272_000, served: 1_000_000 },
 ];
 
