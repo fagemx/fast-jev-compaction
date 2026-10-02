@@ -142,10 +142,34 @@ export function truncatedResultText(text: string, isError: boolean, headChars: n
 }
 
 /**
- * Rebuilds the conversation from the decisions. A dropped call disappears
- * together with its result; a dropped result keeps a bounded head and note.
- * Messages that lose all their content are removed; untouched messages are
- * returned as the same objects they came in as.
+ * Cuts every long string in a stubbed call's input to its head and a note.
+ * Strings up to `headChars + 60` stay, so an abridged input is left as it is
+ * when compaction runs again.
+ */
+export function abridgeInput(value: unknown, headChars: number): unknown {
+  if (typeof value === 'string') {
+    if (value.length <= headChars + 60) return value;
+    const head = headOf(value, headChars);
+    return `${head}…[fast-jev-compaction truncated ${value.length - head.length} chars]`;
+  }
+  if (Array.isArray(value)) return value.map((item) => abridgeInput(item, headChars));
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, abridgeInput(item, headChars)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Rebuilds the conversation from the decisions. A dropped result keeps a
+ * bounded head and note. A dropped call is not deleted but stubbed: the call
+ * stays with its long input strings abridged, and its result is replaced by
+ * the note alone, which marks the gap. The history keeps a call behind every
+ * report, and the marker sits in a tool result, never in the assistant's own
+ * words, which a model has been seen to imitate (upstream #65). Untouched
+ * messages, and parts a cut leaves as they were, are returned as the same
+ * objects they came in as.
  */
 export function applyDecisions(
   messages: readonly Message[],
@@ -159,70 +183,37 @@ export function applyDecisions(
     const call = byId.get(decision.id);
     if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
   }
-  const kept: Message[] = [];
-  for (const message of messages) {
-    const touched =
-      message.toolUses.some((tool) => actions.has(tool.tool_use_id)) ||
-      (message.toolResults ?? []).some((result) => actions.has(result.tool_use_id));
-    if (!touched) {
-      kept.push(message);
-      continue;
-    }
-    const toolUses = message.toolUses
-      .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
-      .map((tool) => {
-        if (actions.get(tool.tool_use_id) !== 'drop_result') return tool;
-        const text = truncatedResultText(
-          tool.text ?? '',
-          tool.isError ?? false,
-          headChars,
-        );
-        if ((tool.text ?? '') === text) return tool;
-        const copy: ToolUse = {
-          tool_use_id: tool.tool_use_id,
-          tool: tool.tool,
-          input: tool.input,
-          text,
-        };
-        if (tool.isError) copy.isError = true;
-        return copy;
-      });
-    const toolResults = (message.toolResults ?? [])
-      .filter((result) => actions.get(result.tool_use_id) !== 'drop_call')
-      .map((result) => {
-        if (actions.get(result.tool_use_id) !== 'drop_result') return result;
-        const text = truncatedResultText(result.text, result.isError ?? false, headChars);
-        return text === result.text
-          ? result
-          : {
-              tool_use_id: result.tool_use_id,
-              text,
-              isError: result.isError,
-            };
-      });
+  const cutText = (id: string, text: string, isError: boolean): string =>
+    truncatedResultText(text, isError, actions.get(id) === 'drop_call' ? 0 : headChars);
+
+  return messages.map((message) => {
+    const toolUses = message.toolUses.map((tool) => {
+      if (!actions.has(tool.tool_use_id)) return tool;
+      const text = cutText(tool.tool_use_id, tool.text ?? '', tool.isError ?? false);
+      const input =
+        actions.get(tool.tool_use_id) === 'drop_call'
+          ? (abridgeInput(tool.input, headChars) as ToolUse['input'])
+          : tool.input;
+      if ((tool.text ?? '') === text && JSON.stringify(input) === JSON.stringify(tool.input)) return tool;
+      const copy: ToolUse = { tool_use_id: tool.tool_use_id, tool: tool.tool, input, text };
+      if (tool.isError) copy.isError = true;
+      return copy;
+    });
+    const toolResults = message.toolResults?.map((result) => {
+      if (!actions.has(result.tool_use_id)) return result;
+      const text = cutText(result.tool_use_id, result.text, result.isError ?? false);
+      return text === result.text ? result : { tool_use_id: result.tool_use_id, text, isError: result.isError };
+    });
     if (
-      !message.toolUses.some(
-        (tool) => actions.get(tool.tool_use_id) === 'drop_call',
-      ) &&
-      !(message.toolResults ?? []).some(
-        (result) => actions.get(result.tool_use_id) === 'drop_call',
-      ) &&
       toolUses.every((tool, index) => tool === message.toolUses[index]) &&
-      toolResults.every(
-        (result, index) => result === message.toolResults?.[index],
-      )
+      (toolResults ?? []).every((result, index) => result === message.toolResults?.[index])
     ) {
-      kept.push(message);
-      continue;
-    }
-    if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
-      continue;
+      return message;
     }
     const rebuilt: Message = { role: message.role, text: message.text, toolUses };
-    if (toolResults.length > 0) rebuilt.toolResults = toolResults;
-    kept.push(rebuilt);
-  }
-  return kept;
+    if (toolResults && toolResults.length > 0) rebuilt.toolResults = toolResults;
+    return rebuilt;
+  });
 }
 
 /** Characters of text, tool input and tool output a message holds. */

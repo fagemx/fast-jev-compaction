@@ -9,8 +9,8 @@ import type {
 
 import { resolveHookConfig, type HookConfig } from '../hooks/fast-jev.js';
 import { JevClient } from '../src/client.js';
-import { compact, resolveOptions, truncatedResultText } from '../src/compact.js';
-import { estimateTokens, goalFromMessages, headOf } from '../src/state.js';
+import { compact, resolveOptions } from '../src/compact.js';
+import { estimateTokens, goalFromMessages } from '../src/state.js';
 import type { CompactResult, JevAsker, Message, ToolUse } from '../src/types.js';
 
 /** `customType` of the session entry recording each run's stats and decisions. */
@@ -196,26 +196,6 @@ export function toTranscript(entries: readonly ProjectedLike[]): PiTranscript {
   return transcript;
 }
 
-/**
- * Cuts every long string in a stubbed call's input to its head and a note.
- * Strings up to `headChars + 60` stay, so an abridged input is left as it is
- * when compaction runs again.
- */
-export function abridgeInput(value: unknown, headChars: number): unknown {
-  if (typeof value === 'string') {
-    if (value.length <= headChars + 60) return value;
-    const head = headOf(value, headChars);
-    return `${head}…[fast-jev-compaction truncated ${value.length - head.length} chars]`;
-  }
-  if (Array.isArray(value)) return value.map((item) => abridgeInput(item, headChars));
-  if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, abridgeInput(item, headChars)]),
-    );
-  }
-  return value;
-}
-
 export type PiEdits = {
   edits: ContextEditEntryDraft[];
   /** Characters of tool input and tool output the edits take out. */
@@ -223,44 +203,38 @@ export type PiEdits = {
 };
 
 /**
- * Turns the library's compacted transcript into Pi context edits. A dropped
- * result keeps the head and note the library gave it. A dropped call is not
- * deleted but stubbed: it stays in its assistant entry with long input
- * strings abridged, and its result is replaced by the library's note alone,
- * which marks the gap. The history keeps a call behind every report, and the
- * marker sits in a tool result, never in the assistant's own words, which a
- * model has been seen to imitate (upstream #65).
+ * Turns the library's compacted transcript into Pi context edits: every tool
+ * call input and tool result the library cut is written over its entry. A
+ * dropped result keeps the head and note the library gave it; a dropped call
+ * comes back stubbed (its long input strings abridged, its result the note
+ * alone), so it stays in its assistant entry and its result marks the gap.
  */
-export function contextEdits(
-  transcript: PiTranscript,
-  compacted: readonly Message[],
-  headChars: number,
-): PiEdits {
-  const keptCalls = new Set<string>();
-  const keptResults = new Map<string, string>();
+export function contextEdits(transcript: PiTranscript, compacted: readonly Message[]): PiEdits {
+  const inputs = new Map<string, ToolUse['input']>();
+  const results = new Map<string, string>();
   for (const message of compacted) {
-    for (const tool of message.toolUses) keptCalls.add(tool.tool_use_id);
-    for (const result of message.toolResults ?? []) keptResults.set(result.tool_use_id, result.text);
+    for (const tool of message.toolUses) inputs.set(tool.tool_use_id, tool.input);
+    for (const result of message.toolResults ?? []) results.set(result.tool_use_id, result.text);
   }
-  const dropped = (id: string) => transcript.callEntries.has(id) && !keptCalls.has(id);
 
   const edits: ContextEditEntryDraft[] = [];
   let charsSaved = 0;
   for (const [entryId, message] of transcript.assistants) {
     let changed = false;
     const content = message.content.map((block) => {
-      if (block.type !== 'toolCall' || !dropped(block.id)) return block;
-      const args = abridgeInput(block.arguments, headChars) as typeof block.arguments;
+      if (block.type !== 'toolCall') return block;
+      const args = inputs.get(block.id);
+      if (args === undefined || args === block.arguments) return block;
       const saved = JSON.stringify(block.arguments).length - JSON.stringify(args).length;
       if (saved <= 0) return block;
       changed = true;
       charsSaved += saved;
-      return { ...block, arguments: args };
+      return { ...block, arguments: args as typeof block.arguments };
     });
     if (changed) edits.push({ type: 'context_edit', targetId: entryId, replacement: { content } });
   }
-  for (const [id, { entryId, text, isError }] of transcript.results) {
-    const next = dropped(id) ? truncatedResultText(text, isError, 0) : keptResults.get(id);
+  for (const [id, { entryId, text }] of transcript.results) {
+    const next = results.get(id);
     if (next === undefined || next === text) continue;
     charsSaved += text.length - next.length;
     edits.push({
@@ -289,11 +263,7 @@ export async function compactEntries(
   // text too; the default goal would take them for the task.
   const goal = config.goal || transcript.goal;
   const result = await compact(transcript.messages, asker, { ...config, goal });
-  const { edits, charsSaved } = contextEdits(
-    transcript,
-    result.messages,
-    resolveOptions(config).truncateHeadChars,
-  );
+  const { edits, charsSaved } = contextEdits(transcript, result.messages);
   const { charsBefore } = result.stats;
   return { result, edits, charsSaved, ratio: charsBefore === 0 ? 0 : charsSaved / charsBefore };
 }
@@ -433,7 +403,7 @@ export async function compactRegion(
   const goal = config.goal || [extras.customInstructions, transcript.goal].filter(Boolean).join('\n');
   const result = await compact(transcript.messages, asker, { ...config, goal, preserveRecentMessages });
 
-  const { edits } = contextEdits(transcript, result.messages, options.truncateHeadChars);
+  const { edits } = contextEdits(transcript, result.messages);
   const replacements = new Map(edits.map((edit) => [edit.targetId, edit.replacement]));
   const edited = region.flatMap((message, index) => {
     const replacement = replacements.get(`region-${index}`);

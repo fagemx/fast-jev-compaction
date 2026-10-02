@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { headOf, tailOf, truncate } from '../src/index.js';
-import { abridgeInput } from '../pi/fast-jev.ts';
+import { abridgeInput, headOf, tailOf, truncate } from '../src/index.js';
 
 const emoji = '\u{1F600}';
 const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;

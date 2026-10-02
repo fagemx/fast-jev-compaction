@@ -8,7 +8,6 @@ import type {
   TurnEndEventResult,
 } from '@earendil-works/pi-coding-agent';
 import {
-  abridgeInput,
   compactEntries,
   contextEdits,
   createFastJev,
@@ -22,7 +21,7 @@ import {
   type JevEndpoint,
 } from '../pi/fast-jev.ts';
 import { resolveHookConfig } from '../hooks/fast-jev.ts';
-import type { JevAsker } from '../src/index.js';
+import { abridgeInput, type JevAsker } from '../src/index.js';
 import {
   asker,
   assistant,
@@ -182,7 +181,7 @@ describe('compactEntries', () => {
 
   it('makes no edits when everything is kept', () => {
     const transcript = toTranscript(session());
-    expect(contextEdits(transcript, transcript.messages, 300)).toEqual({ edits: [], charsSaved: 0 });
+    expect(contextEdits(transcript, transcript.messages)).toEqual({ edits: [], charsSaved: 0 });
   });
 
   it('cuts only long strings, at any depth', () => {

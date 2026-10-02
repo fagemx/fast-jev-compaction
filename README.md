@@ -8,18 +8,19 @@ word for word. Ships as a [Pi extension](#pi-extension), a
 > This is the maintained fork at
 > [fagemx/fast-jev-compaction](https://github.com/fagemx/fast-jev-compaction) of
 > [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction).
-> On top of upstream it adds the Pi extension, redacts secrets from every Jev
-> request, cuts text on code point boundaries, rejects malformed Jev
-> probabilities and estimates dense tokens better; several of these come from
-> open upstream pull requests, credited in the commits.
+> On top of upstream it adds the Pi extension, stubs dropped calls instead of
+> deleting them (both hosts), redacts secrets from every Jev request, cuts text
+> on code point boundaries, rejects malformed Jev probabilities and estimates
+> dense tokens better; several of these come from open upstream pull requests,
+> credited in the commits.
 
 ## What and why
 
 Most context compaction asks an LLM to summarize old turns. A summary is
 lossy: a file path, exact error, constraint, or command can disappear even when
-it matters later. This library never rewrites anything. It only deletes tool
-calls and tool results Jev says are no longer needed, and it asks Jev while
-showing it the whole conversation. User and assistant text stays verbatim and
+it matters later. This library never rewrites anything. It only cuts the tool
+results Jev says are no longer needed down to a marked note, and it asks Jev
+while showing it the whole conversation. User and assistant text stays verbatim and
 in order.
 
 The repository is an npm package (`src/`), a Claude Code plugin (`hooks/`,
@@ -56,10 +57,16 @@ place of their built-in compaction summary.
    - `keepResult ≥ threshold` → keep call and result;
    - else `keepCall ≥ threshold` → keep the call, truncate the result to its
      first `truncateHeadChars` characters plus a one-line note;
-   - else → remove the call together with its result.
-7. The message list is rebuilt: a message that loses all its content is
-   removed, untouched messages are returned as the same objects, and no result
-   is ever left without its call.
+   - else → stub the call: it stays, long strings in its input cut to their
+     first `truncateHeadChars` characters plus a note, and its result becomes
+     the note alone (`[fast-jev-compaction truncated N chars of this tool
+     result; re-run the tool if needed]`). The history keeps a call behind
+     every report the assistant made, and the gap is marked inside a tool
+     result, not in the assistant's own words, which a model has been seen to
+     imitate (#65, #123).
+7. The message list is rebuilt: no message is removed, untouched messages are
+   returned as the same objects, and a stub is left as it is when compaction
+   runs again.
 
 Jev failures, malformed answers, a missing key, or a history that cannot be
 fitted throw; the caller (or the Claude Code hook) decides what to fall back to.

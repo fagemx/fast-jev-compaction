@@ -121,8 +121,11 @@ describe('compactSession', () => {
     expect(bodies).toHaveLength(1);
     expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
-    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
-    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
+    expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
+    const stub = `[fast-jev-compaction truncated ${fileA.length} chars of this tool result; re-run the tool if needed]`;
+    expect(messages[1]?.toolUses).toEqual([{ tool_use_id: 'tool-1', tool: 'Read', input: { file_path: 'src/a.ts' }, text: stub }]);
+    expect(messages[2]?.toolResults).toEqual([{ tool_use_id: 'tool-1', text: stub, isError: false }]);
+    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 calls stubbed; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });

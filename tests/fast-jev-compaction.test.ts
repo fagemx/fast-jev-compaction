@@ -285,7 +285,7 @@ describe('decisions', () => {
     });
   });
 
-  it('removes dropped calls and truncates dropped results', () => {
+  it('stubs dropped calls and truncates dropped results', () => {
     const messages = transcript();
     messages[4]!.toolUses[0]!.text = 'x'.repeat(2000);
     messages[5]!.toolResults![0]!.text = 'x'.repeat(2000);
@@ -296,36 +296,50 @@ describe('decisions', () => {
       decideCall(calls[2]!, { keepCall: 0.9, keepResult: 0.9 }, options),
     ];
     const kept = applyDecisions(messages, decisions, calls, 300);
+    const stub = `[fast-jev-compaction truncated ${fileA.length} chars of this tool result; re-run the tool if needed]`;
 
-    expect(kept.map((m) => m.text || m.toolUses[0]?.tool_use_id || m.toolResults?.[0]?.tool_use_id)).toEqual([
-      'Never edit anything under src/generated. Fix the failing test.',
-      'a.ts looks fine; checking b.ts',
-      'tool-2',
-      'tool-2',
-      'tool-3',
-      'tool-3',
-      'The failure is in b.test.ts; fixing now.',
-      'go ahead',
-    ]);
+    expect(kept).toHaveLength(messages.length);
     expect(kept[0]).toBe(messages[0]);
-    expect(kept[2]).not.toBe(messages[4]);
-    expect(kept[2]?.toolUses[0]?.text).toMatch(
+    expect(kept[1]?.toolUses).toEqual([{ tool_use_id: 'tool-1', tool: 'Read', input: { file_path: 'src/a.ts' }, text: stub }]);
+    expect(kept[2]?.toolResults).toEqual([{ tool_use_id: 'tool-1', text: stub, isError: false }]);
+    expect(kept[3]).toBe(messages[3]);
+    expect(kept[4]?.toolUses[0]?.text).toMatch(
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
     );
-    expect(kept[3]?.toolResults?.[0]?.text).toMatch(
+    expect(kept[5]?.toolResults?.[0]?.text).toMatch(
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
     );
-    expect(kept[2]).not.toBe(messages[4]);
-    expect(kept[3]).not.toBe(messages[5]);
-    expect(kept[4]).toBe(messages[6]);
-    expect(kept[5]?.toolResults?.[0]?.text).toContain('expected 2 to be 3');
+    expect(kept[4]).not.toBe(messages[4]);
+    expect(kept[5]).not.toBe(messages[5]);
+    expect(kept[6]).toBe(messages[6]);
+    expect(kept[7]?.toolResults?.[0]?.text).toContain('expected 2 to be 3');
 
     const shortMessages = transcript();
     shortMessages[4]!.toolUses[0]!.text = 'y'.repeat(100);
     shortMessages[5]!.toolResults![0]!.text = 'y'.repeat(100);
     const shortKept = applyDecisions(shortMessages, decisions, calls, 300);
-    expect(shortKept[2]).toBe(shortMessages[4]);
-    expect(shortKept[3]).toBe(shortMessages[5]);
+    expect(shortKept[4]).toBe(shortMessages[4]);
+    expect(shortKept[5]).toBe(shortMessages[5]);
+  });
+
+  it('abridges the long input strings of a stubbed call and leaves a stub as it is', () => {
+    const content = 'c'.repeat(2000);
+    const messages = [
+      message('user', 'write it'),
+      call('w', 'Write', { file_path: 'a.ts', content, lines: [content], mode: 1 }, 'ok'),
+      result('w', 'ok'),
+      message('assistant', 'done'),
+    ];
+    const calls = collectToolCalls(messages, 0);
+    const decisions = [decideCall(calls[0]!, { keepCall: 0.1, keepResult: 0.1 }, options)];
+    const kept = applyDecisions(messages, decisions, calls, 300);
+    const abridged = `${'c'.repeat(300)}…[fast-jev-compaction truncated 1700 chars]`;
+
+    expect(kept[1]?.toolUses[0]?.input).toEqual({ file_path: 'a.ts', content: abridged, lines: [abridged], mode: 1 });
+    expect(kept[2]).toBe(messages[2]);
+
+    const again = applyDecisions(kept, decisions, collectToolCalls(kept, 0), 300);
+    expect(again[1]).toBe(kept[1]);
   });
 
   it('honours truncateHeadChars, including a zero head', () => {
