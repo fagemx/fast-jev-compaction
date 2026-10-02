@@ -2,13 +2,15 @@ import type {
   ContextEditEntryDraft,
   CustomEntryDraft,
   ExtensionAPI,
+  ExtensionContext,
   ProjectedSessionEntry,
+  SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent';
 
 import { resolveHookConfig, type HookConfig } from '../hooks/fast-jev.js';
 import { JevClient } from '../src/client.js';
 import { compact, resolveOptions, truncatedResultText } from '../src/compact.js';
-import { goalFromMessages, headOf } from '../src/state.js';
+import { estimateTokens, goalFromMessages, headOf } from '../src/state.js';
 import type { CompactResult, JevAsker, Message, ToolUse } from '../src/types.js';
 
 /** `customType` of the session entry recording each run's stats and decisions. */
@@ -23,6 +25,9 @@ export const OPENROUTER_JEV_MODEL = 'typesafe/jev-1.13';
 
 // Pi's message and content types, from the one module an extension can rely on.
 type AgentMessage = ProjectedSessionEntry['messages'][number];
+type CompactionPreparation = SessionBeforeCompactEvent['preparation'];
+/** What `toTranscript` reads of a projected entry. */
+type ProjectedLike = { sourceEntry: { id: string }; messages: readonly AgentMessage[] };
 type AssistantMessage = Extract<AgentMessage, { role: 'assistant' }>;
 type ContentBlock =
   | AssistantMessage['content'][number]
@@ -54,12 +59,14 @@ export interface PiSettings {
   baseUrl?: string;
   /** Deadline for one Jev request, body included. */
   timeoutMs: number;
+  /** Largest share of the context window a verbatim compaction summary may take. */
+  summaryShare: number;
 }
 
 /**
  * Settings from the environment: the plugin options from `FAST_JEV_*`
  * variables, `FAST_JEV_PROVIDER` (`typesafe` or `openrouter`),
- * `FAST_JEV_BASE_URL` and `FAST_JEV_TIMEOUT_MS`. The key is
+ * `FAST_JEV_BASE_URL`, `FAST_JEV_TIMEOUT_MS` and `FAST_JEV_SUMMARY_SHARE`. The key is
  * `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` for OpenRouter (which also
  * defaults the model to `typesafe/jev-1.13`).
  */
@@ -79,10 +86,12 @@ export function piSettings(env: Readonly<Record<string, string | undefined>>): P
   if (apiKey) options.apiKey = apiKey;
   if (provider === 'openrouter' && options.model === undefined) options.model = OPENROUTER_JEV_MODEL;
   const timeout = Number(env.FAST_JEV_TIMEOUT_MS);
+  const share = Number(env.FAST_JEV_SUMMARY_SHARE);
   const settings: PiSettings = {
     options,
     provider,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 15_000,
+    summaryShare: Number.isFinite(share) && share > 0 && share <= 1 ? share : 0.25,
   };
   const baseUrl = env.FAST_JEV_BASE_URL?.trim();
   if (baseUrl) settings.baseUrl = baseUrl;
@@ -132,7 +141,7 @@ export interface PiTranscript {
  * becomes one user message, as in a Claude Code transcript, so
  * `preserveRecentMessages` counts the same; system messages are left out.
  */
-export function toTranscript(entries: readonly ProjectedSessionEntry[]): PiTranscript {
+export function toTranscript(entries: readonly ProjectedLike[]): PiTranscript {
   const transcript: PiTranscript = {
     messages: [],
     callEntries: new Map(),
@@ -282,8 +291,132 @@ export async function compactEntries(
   return { result, edits, charsSaved, ratio: charsBefore === 0 ? 0 : charsSaved / charsBefore };
 }
 
+/**
+ * A Pi message as a verbatim compaction summary shows it, in the
+ * `[Role]: text` shape of Pi's own summarizer input. Thinking and system
+ * messages are left out; tool inputs are written as JSON.
+ */
+export function serializeMessage(message: AgentMessage): string | undefined {
+  const blocks = (content: string | readonly ContentBlock[]) =>
+    typeof content === 'string'
+      ? content
+      : content
+          .map((block) => (block.type === 'text' ? block.text : block.type === 'image' ? '[image]' : ''))
+          .filter(Boolean)
+          .join('\n');
+  switch (message.role) {
+    case 'user':
+      return `[User]: ${blocks(message.content)}`;
+    case 'assistant': {
+      const lines = message.content.flatMap((block) =>
+        block.type === 'text' && block.text.trim() !== ''
+          ? [`[Assistant]: ${block.text}`]
+          : block.type === 'toolCall'
+            ? [`[Assistant tool call]: ${block.name}(${JSON.stringify(block.arguments)})`]
+            : [],
+      );
+      return lines.length > 0 ? lines.join('\n') : undefined;
+    }
+    case 'toolResult':
+      return `[Tool result ${message.toolName}${message.isError ? ' (error)' : ''}]: ${blocks(message.content)}`;
+    case 'bashExecution':
+      return `[User bash]: $ ${message.command}\n${message.output}`;
+    case 'custom':
+      return `[${message.customType}]: ${blocks(message.content)}`;
+    case 'branchSummary':
+    case 'compactionSummary':
+      return `[Summary]: ${message.summary}`;
+    default:
+      return undefined;
+  }
+}
+
+const SUMMARY_HEADER =
+  'fast-jev-compaction kept the earlier conversation below verbatim instead of summarizing it. ' +
+  'Tool outputs Jev judged no longer needed are cut to a note; re-run the tool if one of them is needed.';
+
+export interface RegionCompaction {
+  result: CompactResult;
+  summary: string;
+  /** Characters of the region's transcript before and after the cuts. */
+  charsBefore: number;
+  charsAfter: number;
+  /** Share of the region's characters the cuts take out. */
+  ratio: number;
+}
+
+/**
+ * Compaction without an LLM summary. Jev scores the region Pi would
+ * summarize, with the kept messages after it as pinned context; the region is
+ * then written out verbatim, its dropped tool outputs cut exactly as
+ * `contextEdits` cuts them in place, behind the previous summary and followed
+ * by the files it read and changed, the way Pi's own summary lists them.
+ */
+export async function compactRegion(
+  region: readonly AgentMessage[],
+  kept: readonly ProjectedSessionEntry[],
+  config: HookConfig,
+  asker: JevAsker,
+  extras: {
+    previousSummary?: string;
+    customInstructions?: string;
+    fileOps?: CompactionPreparation['fileOps'];
+  },
+): Promise<RegionCompaction> {
+  const regionEntries: ProjectedLike[] = region.map((message, index) => ({
+    sourceEntry: { id: `region-${index}` },
+    messages: [message],
+  }));
+  const transcript = toTranscript([...regionEntries, ...kept]);
+  const options = resolveOptions(config);
+  // Pi's kept window is the recent history here; the default pin of the 6
+  // newest messages would reach past it into the region. An explicit
+  // preserveRecentMessages still applies.
+  const keptMessages = toTranscript(kept).messages.length;
+  const preserveRecentMessages =
+    keptMessages > 0
+      ? Math.max(keptMessages, config.preserveRecentMessages ?? 0)
+      : options.preserveRecentMessages;
+  // `/compact <instructions>` says what matters now; it leads the goal.
+  const goal = config.goal || [extras.customInstructions, transcript.goal].filter(Boolean).join('\n');
+  const result = await compact(transcript.messages, asker, { ...config, goal, preserveRecentMessages });
+
+  const { edits } = contextEdits(transcript, result.messages, options.truncateHeadChars);
+  const replacements = new Map(edits.map((edit) => [edit.targetId, edit.replacement]));
+  const edited = region.flatMap((message, index) => {
+    const replacement = replacements.get(`region-${index}`);
+    if (replacement === undefined) return [message];
+    return replacement === null ? [] : [{ ...message, content: replacement.content } as AgentMessage];
+  });
+  const write = (messages: readonly AgentMessage[]) =>
+    messages.flatMap((message) => serializeMessage(message) ?? []).join('\n\n');
+  const before = write(region);
+  const after = write(edited);
+
+  const sections = [SUMMARY_HEADER];
+  if (extras.previousSummary) sections.push(`<previous-summary>\n${extras.previousSummary}\n</previous-summary>`);
+  sections.push(`<conversation>\n${after}\n</conversation>`);
+  if (extras.fileOps) {
+    const modified = [...new Set([...extras.fileOps.written, ...extras.fileOps.edited])].sort();
+    const read = [...extras.fileOps.read].filter((file) => !modified.includes(file)).sort();
+    if (read.length > 0) sections.push(`<read-files>\n${read.join('\n')}\n</read-files>`);
+    if (modified.length > 0) sections.push(`<modified-files>\n${modified.join('\n')}\n</modified-files>`);
+  }
+  return {
+    result,
+    summary: sections.join('\n\n'),
+    charsBefore: before.length,
+    charsAfter: after.length,
+    ratio: before.length === 0 ? 0 : 1 - after.length / before.length,
+  };
+}
+
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
+}
+
+function tokenCount(tokens: number): string {
+  return tokens < 1000 ? `${Math.round(tokens)} tokens` : `~${Math.round(tokens / 1000)}k tokens`;
 }
 
 /** One line on a run, for the TUI notification. */
@@ -323,14 +456,23 @@ export function timedAsker({ apiKey, model, baseUrl, timeoutMs, signal }: JevEnd
 }
 
 /**
- * The Pi extension. At the end of a turn whose context is at or above
- * `compactAtPercent`, Jev decides which older tool calls and results still
- * matter, and the rest shrink in the model context through append-only
- * `context_edit` entries (see `contextEdits`); everything kept stays
- * verbatim, no summary. Below `minReductionRatio`, without a key, or when Jev
- * fails or times out, nothing changes and Pi's own summary compaction stays
- * the fallback. A run is retried only after the context grows by another 10%
- * of the window, or after it drops below the threshold.
+ * The Pi extension, on two paths.
+ *
+ * At the end of a turn whose context is at or above `compactAtPercent`, Jev
+ * decides which older tool calls and results still matter, and the rest
+ * shrink in the model context through append-only `context_edit` entries
+ * (see `contextEdits`): no summary at all. A run is retried only after the
+ * context grows by another 10% of the window, or after it drops below the
+ * threshold.
+ *
+ * When Pi compacts anyway (`/compact`, its threshold, or overflow recovery),
+ * Jev scores what Pi would summarize and the extension hands back that history
+ * verbatim, stale tool outputs cut, instead of an LLM summary (see
+ * `compactRegion`).
+ *
+ * Below `minReductionRatio`, over the summary budget, without a key, or when
+ * Jev fails or times out, nothing changes and Pi's own summary stays the
+ * fallback.
  */
 export function createFastJev(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -340,6 +482,39 @@ export function createFastJev(
     const settings = piSettings(env);
     const config = resolveHookConfig(settings.options);
     let lastAttemptTokens: number | undefined;
+
+    const notifier =
+      (ctx: ExtensionContext) =>
+      (text: string, type: 'info' | 'warning' = 'info') => {
+        if (ctx.hasUI) ctx.ui.notify(`fast-jev: ${text}`, type);
+      };
+    /** The endpoint for one run, or why there is none. */
+    const endpointFor = async (
+      ctx: ExtensionContext,
+      signal: AbortSignal | undefined,
+    ): Promise<JevEndpoint | string> => {
+      // Without OPENROUTER_API_KEY, OpenRouter falls back to Pi's own login.
+      const apiKey =
+        config.apiKey ??
+        (settings.provider === 'openrouter'
+          ? await ctx.modelRegistry.getApiKeyForProvider('openrouter')
+          : undefined);
+      if (!apiKey) {
+        return settings.provider === 'openrouter'
+          ? "no OpenRouter key (OPENROUTER_API_KEY or Pi's OpenRouter login)"
+          : 'TYPESAFE_API_KEY is not set';
+      }
+      const endpoint: JevEndpoint = { apiKey, model: config.model, timeoutMs: settings.timeoutMs };
+      if (settings.baseUrl) endpoint.baseUrl = settings.baseUrl;
+      if (signal) endpoint.signal = signal;
+      return endpoint;
+    };
+    const failure = (error: unknown) =>
+      error instanceof Error && error.name === 'TimeoutError'
+        ? `no Jev answer within ${settings.timeoutMs / 1000} s`
+        : error instanceof Error
+          ? error.message
+          : String(error);
 
     pi.on('turn_end', async (event, ctx) => {
       const usage = ctx.getContextUsage();
@@ -356,29 +531,13 @@ export function createFastJev(
       }
       lastAttemptTokens = usage.tokens;
 
-      const notify = (text: string, type: 'info' | 'warning' = 'info') => {
-        if (ctx.hasUI) ctx.ui.notify(`fast-jev: ${text}`, type);
-      };
+      const notify = notifier(ctx);
       try {
-        // Without OPENROUTER_API_KEY, OpenRouter falls back to Pi's own login.
-        const apiKey =
-          config.apiKey ??
-          (settings.provider === 'openrouter'
-            ? await ctx.modelRegistry.getApiKeyForProvider('openrouter')
-            : undefined);
-        if (!apiKey) {
-          notify(
-            settings.provider === 'openrouter'
-              ? "no OpenRouter key (OPENROUTER_API_KEY or Pi's OpenRouter login); Pi's built-in compaction stays in charge"
-              : "TYPESAFE_API_KEY is not set; Pi's built-in compaction stays in charge",
-            'warning',
-          );
+        const endpoint = await endpointFor(ctx, ctx.signal);
+        if (typeof endpoint === 'string') {
+          notify(`${endpoint}; Pi's built-in compaction stays in charge`, 'warning');
           return;
         }
-        const endpoint: JevEndpoint = { apiKey, model: config.model, timeoutMs: settings.timeoutMs };
-        if (settings.baseUrl) endpoint.baseUrl = settings.baseUrl;
-        if (ctx.signal) endpoint.signal = ctx.signal;
-
         const run = await compactEntries(event.context.contextEntries, config, askerFor(endpoint));
         const { stats, decisions } = run.result;
         // Stubs keep every message; only characters leave the context.
@@ -396,13 +555,60 @@ export function createFastJev(
         notify(`${edits.length} context edits, no summary (${describeRun(run)})`);
         return { entries: [...event.entries, ...edits, record] };
       } catch (error) {
-        const reason =
-          error instanceof Error && error.name === 'TimeoutError'
-            ? `no Jev answer within ${settings.timeoutMs / 1000} s`
-            : error instanceof Error
-              ? error.message
-              : String(error);
-        notify(`skipped (${reason}); Pi's compaction stays the fallback`, 'warning');
+        notify(`skipped (${failure(error)}); Pi's compaction stays the fallback`, 'warning');
+        return;
+      }
+    });
+
+    pi.on('session_before_compact', async (event, ctx) => {
+      const notify = notifier(ctx);
+      const what =
+        event.reason === 'manual' ? '/compact' : event.reason === 'overflow' ? 'overflow compaction' : 'compaction';
+      try {
+        const endpoint = await endpointFor(ctx, event.signal);
+        if (typeof endpoint === 'string') {
+          notify(`${what}: ${endpoint}; Pi summarizes instead`, 'warning');
+          return;
+        }
+        const { preparation } = event;
+        const projection = ctx.sessionManager.buildSessionProjection().entries;
+        const first = projection.findIndex((entry) => entry.sourceEntry.id === preparation.firstKeptEntryId);
+        const run = await compactRegion(
+          [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages],
+          first === -1 ? [] : projection.slice(first),
+          config,
+          askerFor(endpoint),
+          {
+            ...(preparation.previousSummary ? { previousSummary: preparation.previousSummary } : {}),
+            ...(event.customInstructions ? { customInstructions: event.customInstructions } : {}),
+            fileOps: preparation.fileOps,
+          },
+        );
+        const older = `older history: ${describeRun(run)}`;
+        if (run.ratio < config.minReductionRatio) {
+          notify(`${what}: below the ${percent(config.minReductionRatio)} minimum (${older}); Pi summarizes instead`);
+          return;
+        }
+        const tokens = estimateTokens(run.summary);
+        const window = ctx.model?.contextWindow ?? ctx.getContextUsage()?.contextWindow;
+        if (window && tokens > window * settings.summaryShare) {
+          notify(
+            `${what}: the verbatim history would take ${tokenCount(tokens)}, over the ` +
+              `${percent(settings.summaryShare)} budget of the ${tokenCount(window)} window; Pi summarizes instead`,
+          );
+          return;
+        }
+        notify(`${what} by Jev, no LLM summary (${older}; ${tokenCount(tokens)} kept verbatim)`);
+        return {
+          compaction: {
+            summary: run.summary,
+            firstKeptEntryId: preparation.firstKeptEntryId,
+            tokensBefore: preparation.tokensBefore,
+            details: { fastJev: { stats: run.result.stats, decisions: run.result.decisions, ratio: run.ratio } },
+          },
+        };
+      } catch (error) {
+        notify(`${what}: Pi summarizes instead (${failure(error)})`, 'warning');
         return;
       }
     });

@@ -45,7 +45,7 @@ declare module '@earendil-works/pi-coding-agent' {
         timestamp: number;
       }
     | { role: 'system'; timestamp: number }
-    | { role: 'custom'; content: string | (TextContent | ImageContent)[]; timestamp: number }
+    | { role: 'custom'; customType: string; content: string | (TextContent | ImageContent)[]; timestamp: number }
     | { role: 'bashExecution'; command: string; output: string; timestamp: number }
     | { role: 'branchSummary'; summary: string; timestamp: number }
     | { role: 'compactionSummary'; summary: string; timestamp: number };
@@ -88,6 +88,43 @@ declare module '@earendil-works/pi-coding-agent' {
     continue?: boolean;
   }
 
+  export interface CompactionPreparation {
+    /** UUID of first entry to keep */
+    firstKeptEntryId: string;
+    /** Messages that will be summarized and discarded */
+    messagesToSummarize: AgentMessage[];
+    /** Messages that will be turned into turn prefix summary (if splitting) */
+    turnPrefixMessages: AgentMessage[];
+    isSplitTurn: boolean;
+    tokensBefore: number;
+    /** Summary from previous compaction, for iterative update */
+    previousSummary?: string;
+    fileOps: { read: Set<string>; written: Set<string>; edited: Set<string> };
+    settings: { enabled: boolean; reserveTokens: number; keepRecentTokens: number };
+  }
+
+  export interface SessionBeforeCompactEvent {
+    type: 'session_before_compact';
+    preparation: CompactionPreparation;
+    customInstructions?: string;
+    /** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
+    reason: 'manual' | 'threshold' | 'overflow';
+    willRetry: boolean;
+    signal: AbortSignal;
+  }
+
+  export interface CompactionResult {
+    summary: string;
+    firstKeptEntryId: string;
+    tokensBefore: number;
+    details?: unknown;
+  }
+
+  export interface SessionBeforeCompactResult {
+    cancel?: boolean;
+    compaction?: CompactionResult;
+  }
+
   export interface ContextUsage {
     /** Estimated context tokens, or null if unknown (e.g. right after compaction). */
     tokens: number | null;
@@ -102,10 +139,19 @@ declare module '@earendil-works/pi-coding-agent' {
     /** The current abort signal, or undefined when the agent is not streaming. */
     signal: AbortSignal | undefined;
     modelRegistry: { getApiKeyForProvider(provider: string): Promise<string | undefined> };
+    model: { contextWindow: number } | undefined;
+    sessionManager: { buildSessionProjection(): { entries: ProjectedSessionEntry[] } };
     getContextUsage(): ContextUsage | undefined;
   }
 
   export interface ExtensionAPI {
+    on(
+      event: 'session_before_compact',
+      handler: (
+        event: SessionBeforeCompactEvent,
+        ctx: ExtensionContext,
+      ) => Promise<SessionBeforeCompactResult | void> | SessionBeforeCompactResult | void,
+    ): () => void;
     on(
       event: 'turn_end',
       handler: (

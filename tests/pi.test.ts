@@ -3,8 +3,6 @@ import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type {
   ContextEditEntryDraft,
-  ExtensionAPI,
-  ExtensionContext,
   ProjectedSessionEntry,
   TurnEndEvent,
   TurnEndEventResult,
@@ -25,68 +23,21 @@ import {
 } from '../pi/fast-jev.ts';
 import { resolveHookConfig } from '../hooks/fast-jev.ts';
 import type { JevAsker } from '../src/index.js';
-
-type AgentMessage = ProjectedSessionEntry['messages'][number];
-
-const fileA = 'export const a = 1;\n'.repeat(50);
-const fileB = 'export const b = 2;\n'.repeat(50);
-
-function entry(id: string, message: AgentMessage): ProjectedSessionEntry {
-  return { sourceEntry: { id, type: 'message' }, messages: [message] };
-}
-
-function user(id: string, text: string): ProjectedSessionEntry {
-  return entry(id, { role: 'user', content: text, timestamp: 0 });
-}
-
-function assistant(id: string, content: Extract<AgentMessage, { role: 'assistant' }>['content']) {
-  return entry(id, { role: 'assistant', content, timestamp: 0 });
-}
-
-function toolCall(id: string, name: string, args: Record<string, unknown>) {
-  return { type: 'toolCall' as const, id, name, arguments: args };
-}
-
-function toolResult(id: string, callId: string, text: string, isError = false) {
-  return entry(id, {
-    role: 'toolResult',
-    toolCallId: callId,
-    toolName: 'tool',
-    content: [{ type: 'text', text }],
-    isError,
-    timestamp: 0,
-  });
-}
-
-function session(): ProjectedSessionEntry[] {
-  return [
-    user('u1', 'Fix the failing test.'),
-    assistant('a1', [{ type: 'text', text: 'Reading.' }, toolCall('c1', 'read', { path: 'src/a.ts' })]),
-    toolResult('r1', 'c1', fileA),
-    assistant('a2', [toolCall('c2', 'bash', { command: 'npm test' })]),
-    toolResult('r2', 'c2', 'FAIL b.test.ts: expected 2 to be 3', true),
-    assistant('a3', [{ type: 'thinking', thinking: 'look at b' }, toolCall('c3', 'read', { path: 'src/b.ts' })]),
-    toolResult('r3', 'c3', fileB),
-    assistant('a4', [{ type: 'text', text: 'Fixing now.' }]),
-    user('u2', 'go ahead'),
-  ];
-}
-
-/** Answers every Jev question from the call's short id (`t1`, `t2`, ...). */
-function asker(answers: Record<string, { call: number; result: number }>): JevAsker {
-  return {
-    async ask(_state, questions) {
-      return {
-        answers: Object.fromEntries(
-          Object.keys(questions).map((name) => {
-            const [kind, id] = name.split('_') as ['call' | 'result', string];
-            return [name, { type: 'noul', noul: answers[id]?.[kind] ?? 1 }];
-          }),
-        ),
-      };
-    },
-  };
-}
+import {
+  asker,
+  assistant,
+  dropEverything,
+  entry,
+  fakeContext,
+  fakePi,
+  fileA,
+  fileB,
+  session,
+  toolCall,
+  toolResult,
+  user,
+  type AgentMessage,
+} from './pi-fixtures.ts';
 
 describe('toTranscript', () => {
   it('maps assistant tool calls and groups consecutive tool results into one user message', () => {
@@ -139,7 +90,7 @@ describe('toTranscript', () => {
       entry('s', { role: 'compactionSummary', summary: 'Earlier work', timestamp: 0 }),
       user('u2', 'Then update the docs.'),
       entry('b', { role: 'bashExecution', command: 'ls', output: 'a.ts', timestamp: 0 }),
-      entry('c', { role: 'custom', content: 'Subagent finished: 3 files', timestamp: 0 }),
+      entry('c', { role: 'custom', customType: 'subagent', content: 'Subagent finished: 3 files', timestamp: 0 }),
     ]);
     expect(transcript.goal).toBe('Fix the failing test.\nThen update the docs.');
   });
@@ -159,7 +110,6 @@ function applyEdits(entries: ProjectedSessionEntry[], edits: readonly ContextEdi
 const textOf = (edit: ContextEditEntryDraft | undefined) =>
   (edit?.replacement?.content as { type: 'text'; text: string }[])[0]!.text;
 
-const dropEverything = { t1: { call: 0.1, result: 0.1 }, t2: { call: 0.1, result: 0.1 }, t3: { call: 0.1, result: 0.1 } };
 
 describe('compactEntries', () => {
   it('truncates dropped results and stubs dropped calls behind a marker result', async () => {
@@ -313,13 +263,7 @@ describe('timedAsker', () => {
 
 describe('the Pi extension', () => {
   function load(env: Record<string, string>, jev: JevAsker, piKeys: Record<string, string> = {}) {
-    let handler: ((event: TurnEndEvent, ctx: ExtensionContext) => unknown) | undefined;
-    const pi = {
-      on(_event: 'turn_end', h: typeof handler) {
-        handler = h;
-        return () => {};
-      },
-    } as unknown as ExtensionAPI;
+    const { pi, handlers } = fakePi();
     const endpoints: JevEndpoint[] = [];
     createFastJev(env, (endpoint) => {
       endpoints.push(endpoint);
@@ -331,20 +275,16 @@ describe('the Pi extension', () => {
       endpoints,
       async turnEnd(percent: number): Promise<TurnEndEventResult | undefined> {
         const prior = { type: 'custom' as const, customType: 'other' };
-        const ctx: ExtensionContext = {
-          hasUI: true,
-          ui: { notify: (message) => notes.push(message) },
-          signal: undefined,
-          modelRegistry: { getApiKeyForProvider: async (provider) => piKeys[provider] },
-          getContextUsage: () => ({ tokens: percent * 1000, contextWindow: 100_000, percent }),
-        };
         const event: TurnEndEvent = {
           type: 'turn_end',
           entries: [prior],
           continue: false,
           context: { contextEntries: session() },
         };
-        return (await handler!(event, ctx)) as TurnEndEventResult | undefined;
+        const handler = handlers.get('turn_end')!;
+        return (await handler(event as never, fakeContext({ notes, percent, piKeys }))) as
+          | TurnEndEventResult
+          | undefined;
       },
     };
   }

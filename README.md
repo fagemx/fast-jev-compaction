@@ -183,11 +183,21 @@ than in the assistant's own words, which a model has been seen to imitate
 context shrinks. Each run also appends a `custom` entry
 (`customType: "fast-jev-compaction"`) with the stats and per-call decisions.
 
-Below `minReductionRatio`, without a key, or when Jev fails, nothing is edited
-and Pi's built-in summary compaction (at `contextWindow - reserveTokens`) stays
-the fallback. After a run the extension waits until the context grows by
-another 10% of the window, or drops back below the threshold, before asking
-Jev again.
+After a run the extension waits until the context grows by another 10% of the
+window, or drops back below the threshold, before asking Jev again.
+
+When Pi compacts anyway (`/compact`, its own threshold at
+`contextWindow - reserveTokens`, or overflow recovery), the extension handles
+`session_before_compact` the same way instead of letting an LLM summarize: Jev
+scores the history Pi would summarize, with Pi's kept window as pinned context,
+and that history goes into the compaction entry verbatim (thinking left out),
+stale tool outputs cut to their note, after the previous summary and followed
+by the files it read and changed. No summarization model is called, so
+compaction takes about a second.
+
+Below `minReductionRatio`, when the verbatim history would exceed
+`FAST_JEV_SUMMARY_SHARE` (0.25) of the context window, without a key, or when
+Jev fails, nothing changes and Pi's own summary stays the fallback.
 
 ```sh
 pi install /path/to/fast-jev-compaction   # or: pi -e /path/to/fast-jev-compaction
