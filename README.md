@@ -283,6 +283,38 @@ request before it leaves the machine, and the goal Jev scores against comes
 from your own prompts, not Pi's summaries, bash runs or other extensions'
 messages.
 
+### When Pi's context window is wrong
+
+The extension sizes its decisions by Pi's own numbers: turn-end runs start at
+a share of the model's context window, and a compaction must leave room under
+Pi's compaction threshold (the window minus `reserveTokens`). Some built-in
+models are listed with a smaller window than the provider serves; Pi lists
+openai-codex's gpt-6 models at 272k, yet requests past 277k tokens succeed.
+Set the window your provider actually serves in `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "openai-codex": {
+      "modelOverrides": {
+        "gpt-6-astra": { "contextWindow": 1000000 }
+      }
+    }
+  }
+}
+```
+
+To have Pi compact before the very edge, raise the reserve for that model in
+`~/.pi/agent/settings.json`; with a 1M window, 100k compacts at 900k:
+
+```json
+{ "compaction": { "modelOverrides": { "openai-codex/gpt-6-astra": { "reserveTokens": 100000 } } } }
+```
+
+`pi --list-models` shows the window Pi uses. On a 1M window the default
+`FAST_JEV_COMPACT_AT_PERCENT` of 60 starts turn-end runs at 600k tokens; a
+lower value such as 30 trims stale tool output sooner.
+
 ### Options
 
 All are environment variables, read when Pi starts.
