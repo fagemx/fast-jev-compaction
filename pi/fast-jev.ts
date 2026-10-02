@@ -64,15 +64,15 @@ export interface PiSettings {
    * context may still take after a Jev compaction; above it Pi summarizes.
    */
   compactTarget: number;
-  /** Correct the built-in model windows Pi lists too small (`WINDOW_FIXES`). */
-  fixWindows: boolean;
+  /** Open the long context `WINDOW_FIXES` lists, at the price it carries. */
+  longContext: boolean;
 }
 
 /**
  * Settings from the environment: the plugin options from `FAST_JEV_*`
  * variables, `FAST_JEV_PROVIDER` (`typesafe` or `openrouter`),
  * `FAST_JEV_BASE_URL`, `FAST_JEV_TIMEOUT_MS`, `FAST_JEV_COMPACT_TARGET` and
- * `FAST_JEV_FIX_WINDOWS`. The key is
+ * `FAST_JEV_LONG_CONTEXT`. The key is
  * `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` for OpenRouter (which also
  * defaults the model to `typesafe/jev-1.13`).
  */
@@ -98,7 +98,7 @@ export function piSettings(env: Readonly<Record<string, string | undefined>>): P
     provider,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 15_000,
     compactTarget: Number.isFinite(target) && target > 0 && target <= 1 ? target : 0.5,
-    fixWindows: !/^(0|false|off|no)$/i.test(env.FAST_JEV_FIX_WINDOWS?.trim() ?? ''),
+    longContext: /^(1|true|on|yes)$/i.test(env.FAST_JEV_LONG_CONTEXT?.trim() ?? ''),
   };
   const baseUrl = env.FAST_JEV_BASE_URL?.trim();
   if (baseUrl) settings.baseUrl = baseUrl;
@@ -491,27 +491,30 @@ export function describeRun({ result, ratio }: Pick<PiCompaction, 'result' | 'ra
   return `${percent(ratio)} reduction; ${parts.join(', ') || 'no tool calls'}; ${stats.requests} Jev request(s) in ${stats.ms} ms`;
 }
 
-/** A built-in model Pi lists with a smaller context window than its provider serves. */
+/** A built-in model whose provider can serve a longer context than Pi's default. */
 export interface WindowFix {
   provider: string;
   model: RegExp;
-  /** The window Pi lists. */
+  /** The window Pi lists by default. */
   listed: number;
-  /** The window the provider serves. */
+  /** The longest window the provider serves. */
   served: number;
 }
 
 /**
- * Pi lists openai-codex's gpt-5.6 and gpt-6 models at 272k, while the ChatGPT
- * backend serves them with 1M: measured on 2026-10-03, gpt-6-astra took a
- * 461k-token prompt and gpt-5.6-luna a 594k one (gpt-5.6-sol and -terra 309k),
- * all read end to end. gpt-5.5 is not listed: it rejected 309k as over its
- * window, so Pi's 272k is right for it. A fix applies only while Pi still lists
- * the model at `listed`, so a models.json override or a corrected Pi catalog wins.
+ * Codex's own model metadata gives openai-codex's gpt-5.6 and gpt-6 models a
+ * `context_window` of 272k and a `max_context_window` of 872k (gpt-5.5: 272k
+ * for both), and Pi follows the 272k default on purpose: past 272k OpenAI bills
+ * the whole request at 2x input and 1.5x output. Measured on 2026-10-03
+ * through Pi's Codex login: gpt-6-astra read 461k tokens and gpt-5.6-luna
+ * 594k end to end, gpt-5.6-luna refused 947k, gpt-5.5 refused 309k. The long
+ * context is opened only on request (`FAST_JEV_LONG_CONTEXT`), and a fix
+ * applies only while Pi still lists the model at `listed`, so a models.json
+ * override or a changed Pi catalog wins.
  */
 export const WINDOW_FIXES: readonly WindowFix[] = [
-  { provider: 'openai-codex', model: /^gpt-5\.6-/, listed: 272_000, served: 1_000_000 },
-  { provider: 'openai-codex', model: /^gpt-6(\.\d+)?-/, listed: 272_000, served: 1_000_000 },
+  { provider: 'openai-codex', model: /^gpt-5\.6-/, listed: 272_000, served: 872_000 },
+  { provider: 'openai-codex', model: /^gpt-6(\.\d+)?-/, listed: 272_000, served: 872_000 },
 ];
 
 /** The provider's models with the windows the fixes correct, or undefined when none needs it. */
@@ -623,9 +626,9 @@ export function createFastJev(
           : String(error);
 
     // Pi sizes its own compaction, and this extension its decisions, by the
-    // model's window; correct the ones Pi lists too small before anything runs.
+    // model's window; with the long context asked for, open it before anything runs.
     pi.on('session_start', (_event, ctx) => {
-      if (!settings.fixWindows) return;
+      if (!settings.longContext) return;
       for (const provider of new Set(WINDOW_FIXES.map((fix) => fix.provider))) {
         const models = ctx.modelRegistry.getProvider(provider)?.getAllModels?.();
         if (!models) continue;
@@ -637,8 +640,9 @@ export function createFastJev(
         const fixed = corrected.filter((model, index) => model !== models[index]).map((model) => model.id);
         const fix = WINDOW_FIXES.find((candidate) => candidate.provider === provider && candidate.model.test(fixed[0]!))!;
         notifier(ctx)(
-          `Pi lists ${provider} ${fixed.join(', ')} at ${windowLabel(fix.listed)}; using the ` +
-            `${windowLabel(fix.served)} window they are served with (FAST_JEV_FIX_WINDOWS=0 turns this off)`,
+          `FAST_JEV_LONG_CONTEXT is on: ${provider} ${fixed.join(', ')} use Codex's ${windowLabel(fix.served)} ` +
+            `maximum instead of ${windowLabel(fix.listed)}; requests past ${windowLabel(fix.listed)} are billed ` +
+            '2x input, 1.5x output',
         );
       }
     });
@@ -728,13 +732,13 @@ export function createFastJev(
         const window = ctx.model?.contextWindow ?? ctx.getContextUsage()?.contextWindow;
         const threshold = window ? window - preparation.settings.reserveTokens : 0;
         if (threshold > 0 && after > threshold * settings.compactTarget) {
-          // A context larger than the window means the provider serves more
-          // than Pi assumes; the threshold is then too low, not Jev's cuts.
+          // A context past the window means the provider took a longer one
+          // than Pi plans for (on openai-codex, the 2x-priced long context).
           const hint =
             window && preparation.tokensBefore > window
               ? `. The context (${tokenCount(preparation.tokensBefore)}) is already past Pi's ` +
-                `${thousands(window)} window for this model, so that window looks too small; ` +
-                `see "When Pi's context window is wrong" in the README`
+                `${thousands(window)} window for this model; if a longer context is meant, give Pi that ` +
+                `window (see "Long context on openai-codex" in the README)`
               : '';
           notify(
             `${what}: Jev's cuts would leave ${tokenCount(after)}, over ${percent(settings.compactTarget)} of ` +

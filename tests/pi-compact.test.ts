@@ -299,7 +299,7 @@ describe('the Pi extension on /compact and automatic compaction', () => {
     const ext = load(env, asker({ t1: { call: 0.1, result: 0.1 } }), 272_000);
     expect(await ext.compact('manual', preparation({ tokensBefore: 300_000 }))).toBeUndefined();
     expect(ext.notes[0]).toMatch(
-      /Pi summarizes instead\. The context \(~300k tokens\) is already past Pi's ~272k window for this model, so that window looks too small; see "When Pi's context window is wrong" in the README$/,
+      /Pi summarizes instead\. The context \(~300k tokens\) is already past Pi's ~272k window for this model; if a longer context is meant, give Pi that window \(see "Long context on openai-codex" in the README\)$/,
     );
 
     // Within the window, the plain reason is enough.

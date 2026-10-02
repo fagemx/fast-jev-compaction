@@ -9,27 +9,28 @@ const codex = () => [
   { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', contextWindow: 272_000 },
   { id: 'gpt-6-astra', name: 'GPT-6 Astra', contextWindow: 272_000, maxTokens: 128_000 },
   { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', contextWindow: 272_000 },
-  { id: 'gpt-6-luna', name: 'GPT-6 Luna', contextWindow: 1_000_000 },
+  { id: 'gpt-6-luna', name: 'GPT-6 Luna', contextWindow: 500_000 },
 ];
 
 describe('correctedModels', () => {
-  it("raises openai-codex's gpt-5.6 and gpt-6 models from the 272k Pi lists to 1M, and leaves gpt-5.5 at 272k", () => {
+  it("opens openai-codex's gpt-5.6 and gpt-6 models from the 272k default to Codex's 872k maximum, gpt-5.5 not", () => {
     const corrected = correctedModels('openai-codex', codex(), WINDOW_FIXES)!;
     expect(corrected.map((m) => [m.id, m.contextWindow])).toEqual([
       ['gpt-5.3-codex-spark', 128_000],
       ['gpt-5.5', 272_000],
-      ['gpt-5.6-luna', 1_000_000],
-      ['gpt-5.6-terra', 1_000_000],
-      ['gpt-6-astra', 1_000_000],
-      ['gpt-6.1-sol', 1_000_000],
-      ['gpt-6-luna', 1_000_000],
+      ['gpt-5.6-luna', 872_000],
+      ['gpt-5.6-terra', 872_000],
+      ['gpt-6-astra', 872_000],
+      ['gpt-6.1-sol', 872_000],
+      // A window someone already set is theirs.
+      ['gpt-6-luna', 500_000],
     ]);
     // Everything else about a model stays as Pi has it.
-    expect(corrected[4]).toEqual({ id: 'gpt-6-astra', name: 'GPT-6 Astra', contextWindow: 1_000_000, maxTokens: 128_000 });
+    expect(corrected[4]).toEqual({ id: 'gpt-6-astra', name: 'GPT-6 Astra', contextWindow: 872_000, maxTokens: 128_000 });
   });
 
-  it('leaves models alone once their window is right, and other providers entirely', () => {
-    expect(correctedModels('openai-codex', codex().map((m) => ({ ...m, contextWindow: 1_000_000 })), WINDOW_FIXES)).toBeUndefined();
+  it('leaves models alone once their window is set, and other providers entirely', () => {
+    expect(correctedModels('openai-codex', codex().map((m) => ({ ...m, contextWindow: 872_000 })), WINDOW_FIXES)).toBeUndefined();
     expect(correctedModels('openrouter', codex(), WINDOW_FIXES)).toBeUndefined();
   });
 });
@@ -48,25 +49,31 @@ describe('the Pi extension at session start', () => {
     };
   }
 
-  it('re-registers openai-codex with the corrected windows, once, and says so', async () => {
+  it("keeps Pi's 272k by default, as Pi and Codex do", async () => {
     const ext = start({}, { 'openai-codex': codex() });
+    await ext.sessionStart();
+    expect(ext.registered).toEqual([]);
+    expect(ext.notes).toEqual([]);
+  });
+
+  it('opens the long context with FAST_JEV_LONG_CONTEXT, once, and says what it costs', async () => {
+    const ext = start({ FAST_JEV_LONG_CONTEXT: '1' }, { 'openai-codex': codex() });
     await ext.sessionStart();
     expect(ext.registered).toHaveLength(1);
     expect(ext.registered[0]!.name).toBe('openai-codex');
-    expect((ext.registered[0]!.models as Array<{ id: string; contextWindow: number }>).find((m) => m.id === 'gpt-6-astra')?.contextWindow).toBe(1_000_000);
+    expect((ext.registered[0]!.models as Array<{ id: string; contextWindow: number }>).find((m) => m.id === 'gpt-6-astra')?.contextWindow).toBe(872_000);
     expect(ext.notes).toEqual([
-      "fast-jev: Pi lists openai-codex gpt-5.6-luna, gpt-5.6-terra, gpt-6-astra, gpt-6.1-sol at 272k; using the 1M window they are served with (FAST_JEV_FIX_WINDOWS=0 turns this off)",
+      'fast-jev: FAST_JEV_LONG_CONTEXT is on: openai-codex gpt-5.6-luna, gpt-5.6-terra, gpt-6-astra, gpt-6.1-sol ' +
+        "use Codex's 872k maximum instead of 272k; requests past 272k are billed 2x input, 1.5x output",
     ]);
   });
 
-  it('registers nothing when the windows are already right, the provider is missing, or the fix is off', async () => {
-    const right = start({}, { 'openai-codex': codex().map((m) => ({ ...m, contextWindow: 1_000_000 })) });
-    await right.sessionStart();
-    const missing = start({}, {});
+  it('registers nothing with the long context on when the windows are already open or the provider is missing', async () => {
+    const open = start({ FAST_JEV_LONG_CONTEXT: 'true' }, { 'openai-codex': codex().map((m) => ({ ...m, contextWindow: 872_000 })) });
+    await open.sessionStart();
+    const missing = start({ FAST_JEV_LONG_CONTEXT: '1' }, {});
     await missing.sessionStart();
-    const off = start({ FAST_JEV_FIX_WINDOWS: '0' }, { 'openai-codex': codex() });
-    await off.sessionStart();
-    expect([...right.registered, ...missing.registered, ...off.registered]).toEqual([]);
-    expect([...right.notes, ...missing.notes, ...off.notes]).toEqual([]);
+    expect([...open.registered, ...missing.registered]).toEqual([]);
+    expect([...open.notes, ...missing.notes]).toEqual([]);
   });
 });

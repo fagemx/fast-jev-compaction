@@ -271,10 +271,9 @@ Pi's own summary stays the fallback, and the notification says why, when:
   history;
 - when compacting, Jev finds nothing stale to cut, or the compacted context
   would still take more than `FAST_JEV_COMPACT_TARGET` (50%) of Pi's
-  compaction threshold, the window minus `reserveTokens`. This is measured
-  against Pi's own threshold, scaled from Pi's token count, rather than as a
-  share of the window, because the window Pi assumes can be wrong:
-  openai-codex models are listed at 272k and accept more;
+  compaction threshold, the window minus `reserveTokens`, scaled from Pi's
+  own token count so that a context already past the window is judged by
+  what it would shrink to;
 - there is no key, Jev fails, or it gives no answer within
   `FAST_JEV_TIMEOUT_MS`; an interrupted turn stops the request too.
 
@@ -283,49 +282,52 @@ request before it leaves the machine, and the goal Jev scores against comes
 from your own prompts, not Pi's summaries, bash runs or other extensions'
 messages.
 
-### When Pi's context window is wrong
+### Long context on openai-codex
 
-The extension sizes its decisions by Pi's own numbers: turn-end runs start at
-a share of the model's context window, and a compaction must leave room under
-Pi's compaction threshold (the window minus `reserveTokens`). Pi lists
-openai-codex's gpt-5.6 and gpt-6 models at 272k, while the ChatGPT backend
-serves them with 1M (measured: gpt-6-astra read a 461k-token prompt end to end,
-gpt-5.6-luna a 594k one), so the extension corrects them when a session
-starts: it re-registers the openai-codex models with that
-one value changed, and Pi keeps its own login and streaming for them. Pi's
-percentage, its compaction point and the extension's decisions then all use
-1M, with nothing to configure. A model is only corrected while Pi still lists
-it at 272k, so a `models.json` override or a fixed Pi catalog wins, and
-`FAST_JEV_FIX_WINDOWS=0` turns the correction off. gpt-5.5 keeps Pi's 272k: it
-rejects a 309k-token prompt as over its window. `pi --list-models` loads no
-extensions and still shows Pi's own value.
+The extension sizes its decisions by Pi's numbers: turn-end runs start at a
+share of the model's context window, and a compaction must leave room under
+Pi's compaction threshold (the window minus `reserveTokens`). For
+openai-codex's gpt-5.6 and gpt-6 models Pi lists 272k, which is Codex's own
+default `context_window`; Codex allows up to a `max_context_window` of 872k
+(gpt-5.5: 272k for both). Pi and Codex keep 272k on purpose: past 272k OpenAI
+bills the whole request at 2x input and 1.5x output. The extension keeps it
+too and compacts to stay under it.
 
-For another model Pi lists too small, set the window your provider serves in
-`~/.pi/agent/models.json`:
+To work with the long context instead, set `FAST_JEV_LONG_CONTEXT=1` in the
+environment Pi starts in. At session start the extension then re-registers
+the openai-codex gpt-5.6 and gpt-6 models with an 872k window, nothing else
+changed (Pi keeps its own login and streaming for them), so Pi's percentage,
+its compaction point and the extension's decisions all use 872k; a
+notification says so, and what it costs. A model is opened only while Pi
+still lists it at 272k, so a `models.json` override or a changed Pi catalog
+wins. Measured on 2026-10-03: gpt-6-astra read a 461k-token prompt and
+gpt-5.6-luna a 594k one end to end; gpt-5.6-luna refused 947k, gpt-5.5 refused
+309k. `pi --list-models` loads no extensions and always shows Pi's own value.
+
+```powershell
+[Environment]::SetEnvironmentVariable('FAST_JEV_LONG_CONTEXT', '1', 'User')
+```
+
+For other models, set a window in `~/.pi/agent/models.json`:
 
 ```json
 {
   "providers": {
     "some-provider": {
       "modelOverrides": {
-        "some-model": { "contextWindow": 1000000 }
+        "some-model": { "contextWindow": 400000 }
       }
     }
   }
 }
 ```
 
-To have Pi compact earlier than the window minus 16k, raise the reserve for
-that model in `~/.pi/agent/settings.json`; on a 1M window, 100k compacts at
-900k:
+and, to have Pi compact earlier than the window minus 16k, a reserve in
+`~/.pi/agent/settings.json`:
 
 ```json
-{ "compaction": { "modelOverrides": { "openai-codex/gpt-6-astra": { "reserveTokens": 100000 } } } }
+{ "compaction": { "modelOverrides": { "some-provider/some-model": { "reserveTokens": 100000 } } } }
 ```
-
-On a 1M window the default `FAST_JEV_COMPACT_AT_PERCENT` of 60 starts
-turn-end runs at 600k tokens; a lower value such as 30 trims stale tool output
-sooner.
 
 ### Options
 
@@ -340,7 +342,7 @@ All are environment variables, read when Pi starts.
 | `FAST_JEV_COMPACT_AT_PERCENT` | `60` | Context percentage at which turn-end compaction runs |
 | `FAST_JEV_MIN_REDUCTION_RATIO` | `0.25` | Least share of characters a turn-end run must remove |
 | `FAST_JEV_COMPACT_TARGET` | `0.5` | Largest share of Pi's compaction threshold the context may take after a Jev compaction |
-| `FAST_JEV_FIX_WINDOWS` | on | Correct the context windows Pi lists too small; `0` turns it off |
+| `FAST_JEV_LONG_CONTEXT` | off | `1` opens openai-codex gpt-5.6 and gpt-6 to Codex's 872k maximum; past 272k requests are billed 2x input, 1.5x output |
 | `FAST_JEV_KEEP_THRESHOLD` | `0.5` | Least keep probability for a call or result to stay |
 | `FAST_JEV_PRESERVE_RECENT_MESSAGES` | `6` at turn end; Pi's kept window when compacting | Newest messages never touched |
 | `FAST_JEV_TRUNCATE_HEAD_CHARS` | `300` | Characters a truncated result or input keeps |
