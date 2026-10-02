@@ -253,6 +253,10 @@ goes into the compaction entry verbatim (thinking left out), stale tool
 outputs cut the same way, after the previous summary and followed by the files
 it read and changed. `/compact <instructions>` leads the goal Jev scores
 against. No summarization model is called, so compaction takes about a second.
+The compaction entry also keeps that history as messages, in its
+`details.fastJev`; the next compaction takes them back and Jev scores them
+again with the new work, so the verbatim history does not pile up from one
+compaction to the next, and a result kept then can still be cut later.
 
 Raw history, the TUI and exports keep everything; only the model context
 shrinks. Each turn-end run appends a `custom` entry
@@ -263,9 +267,14 @@ notification such as `fast-jev: 3 context edits, no summary (…)` or
 
 Pi's own summary stays the fallback, and the notification says why, when:
 
-- Jev cannot remove `FAST_JEV_MIN_REDUCTION_RATIO` (25%) of the history,
-- the verbatim history would take more than `FAST_JEV_SUMMARY_SHARE` (25%) of
-  the context window (compaction only),
+- at turn end, Jev cannot remove `FAST_JEV_MIN_REDUCTION_RATIO` (25%) of the
+  history;
+- when compacting, Jev finds nothing stale to cut, or the compacted context
+  would still take more than `FAST_JEV_COMPACT_TARGET` (50%) of Pi's
+  compaction threshold, the window minus `reserveTokens`. This is measured
+  against Pi's own threshold, scaled from Pi's token count, rather than as a
+  share of the window, because the window Pi assumes can be wrong:
+  openai-codex models are listed at 272k and accept more;
 - there is no key, Jev fails, or it gives no answer within
   `FAST_JEV_TIMEOUT_MS`; an interrupted turn stops the request too.
 
@@ -285,8 +294,8 @@ All are environment variables, read when Pi starts.
 | `FAST_JEV_MODEL` | `jev-latest`; `typesafe/jev-1.13` on OpenRouter | Jev model name |
 | `FAST_JEV_TIMEOUT_MS` | `15000` | Deadline for one Jev request |
 | `FAST_JEV_COMPACT_AT_PERCENT` | `60` | Context percentage at which turn-end compaction runs |
-| `FAST_JEV_MIN_REDUCTION_RATIO` | `0.25` | Least share of characters a run must remove |
-| `FAST_JEV_SUMMARY_SHARE` | `0.25` | Largest share of the window a verbatim compaction may take |
+| `FAST_JEV_MIN_REDUCTION_RATIO` | `0.25` | Least share of characters a turn-end run must remove |
+| `FAST_JEV_COMPACT_TARGET` | `0.5` | Largest share of Pi's compaction threshold the context may take after a Jev compaction |
 | `FAST_JEV_KEEP_THRESHOLD` | `0.5` | Least keep probability for a call or result to stay |
 | `FAST_JEV_PRESERVE_RECENT_MESSAGES` | `6` at turn end; Pi's kept window when compacting | Newest messages never touched |
 | `FAST_JEV_TRUNCATE_HEAD_CHARS` | `300` | Characters a truncated result or input keeps |

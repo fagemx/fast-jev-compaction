@@ -103,9 +103,15 @@ declare module '@earendil-works/pi-coding-agent' {
     settings: { enabled: boolean; reserveTokens: number; keepRecentTokens: number };
   }
 
+  /** The session entries on the current branch, as far as the extension reads them. */
+  export type SessionEntry =
+    | { type: 'compaction'; id: string; summary: string; firstKeptEntryId: string; details?: unknown }
+    | { type: 'message' | 'custom' | 'custom_message' | 'context_edit' | 'branch_summary'; id: string };
+
   export interface SessionBeforeCompactEvent {
     type: 'session_before_compact';
     preparation: CompactionPreparation;
+    branchEntries: SessionEntry[];
     customInstructions?: string;
     /** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
     reason: 'manual' | 'threshold' | 'overflow';

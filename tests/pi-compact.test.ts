@@ -4,7 +4,13 @@ import type {
   SessionBeforeCompactEvent,
   SessionBeforeCompactResult,
 } from '@earendil-works/pi-coding-agent';
-import { compactRegion, createFastJev, serializeMessage, type JevEndpoint } from '../pi/fast-jev.ts';
+import {
+  carriedCompaction,
+  compactRegion,
+  createFastJev,
+  serializeMessage,
+  type JevEndpoint,
+} from '../pi/fast-jev.ts';
 import { resolveHookConfig } from '../hooks/fast-jev.ts';
 import type { JevAsker } from '../src/index.js';
 import {
@@ -12,10 +18,12 @@ import {
   assistant,
   dropEverything,
   fakeContext,
+  entry,
   fakePi,
   fileA,
   fileB,
   session,
+  user,
   toolCall,
   toolResult,
   type AgentMessage,
@@ -107,15 +115,60 @@ describe('compactRegion', () => {
 
   it('lists the files the region read and changed, as Pi does', async () => {
     const run = await compactRegion(region(), kept(), config, asker(dropEverything), {
-      fileOps: { read: new Set(['src/a.ts', 'src/b.ts']), written: new Set(['src/c.ts']), edited: new Set(['src/b.ts']) },
+      files: { read: ['src/a.ts', 'src/b.ts'], modified: ['src/c.ts', 'src/b.ts'] },
     });
     expect(run.summary).toContain('<read-files>\nsrc/a.ts\n</read-files>');
     expect(run.summary).toContain('<modified-files>\nsrc/b.ts\nsrc/c.ts\n</modified-files>');
+    expect(run).toMatchObject({ readFiles: ['src/a.ts'], modifiedFiles: ['src/b.ts', 'src/c.ts'] });
+  });
+
+  it('returns the cut messages without thinking or image data, for the next compaction to carry', async () => {
+    const withImage = [
+      ...region(),
+      ...messagesOf([
+        entry('i', {
+          role: 'toolResult',
+          toolCallId: 'c3',
+          toolName: 'screenshot',
+          content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }],
+          isError: false,
+          timestamp: 0,
+        }),
+      ]),
+    ];
+    const run = await compactRegion(withImage, kept(), config, asker(dropEverything), {});
+    const stored = JSON.stringify(run.messages);
+    expect(stored).not.toContain('look at b');
+    expect(stored).not.toContain('AAAA');
+    expect(stored).toContain('[fast-jev-compaction truncated 1000 chars');
+  });
+
+  it('measures how much of the context is left, kept window included', async () => {
+    const run = await compactRegion(region(), kept(), config, asker(dropEverything), {});
+    expect(run.remaining).toBeGreaterThan(0);
+    expect(run.remaining).toBeLessThan(0.5);
+    const nothing = await compactRegion(region(), kept(), config, asker({}), {});
+    expect(nothing.remaining).toBeGreaterThan(0.99);
+  });
+});
+
+describe('carriedCompaction', () => {
+  const details = { fastJev: { messages: [], readFiles: [], modifiedFiles: [] } };
+  it("picks up the latest compaction when it is Jev's and the one Pi builds on", () => {
+    const entries = [
+      { type: 'compaction' as const, id: 'old', summary: 'older', firstKeptEntryId: 'x', details },
+      { type: 'message' as const, id: 'm' },
+      { type: 'compaction' as const, id: 'new', summary: 'latest', firstKeptEntryId: 'y', details },
+    ];
+    expect(carriedCompaction(entries, 'latest')).toBe(details.fastJev);
+    expect(carriedCompaction(entries, 'older')).toBeUndefined();
+    expect(carriedCompaction([{ type: 'compaction', id: 'p', summary: 'pi', firstKeptEntryId: 'z' }], 'pi')).toBeUndefined();
+    expect(carriedCompaction([], undefined)).toBeUndefined();
   });
 });
 
 describe('the Pi extension on /compact and automatic compaction', () => {
-  function preparation(): CompactionPreparation {
+  function preparation(overrides: Partial<CompactionPreparation> = {}): CompactionPreparation {
     return {
       firstKeptEntryId: 'a4',
       messagesToSummarize: region(),
@@ -124,6 +177,7 @@ describe('the Pi extension on /compact and automatic compaction', () => {
       tokensBefore: 5000,
       fileOps: { read: new Set(['src/a.ts']), written: new Set(), edited: new Set() },
       settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+      ...overrides,
     };
   }
 
@@ -140,10 +194,15 @@ describe('the Pi extension on /compact and automatic compaction', () => {
       notes,
       endpoints,
       signal: turn.signal,
-      async compact(reason: SessionBeforeCompactEvent['reason'] = 'manual') {
+      async compact(
+        reason: SessionBeforeCompactEvent['reason'] = 'manual',
+        prepared: CompactionPreparation = preparation(),
+        branchEntries: SessionBeforeCompactEvent['branchEntries'] = [],
+      ) {
         const event: SessionBeforeCompactEvent = {
           type: 'session_before_compact',
-          preparation: preparation(),
+          preparation: prepared,
+          branchEntries,
           reason,
           willRetry: false,
           signal: turn.signal,
@@ -165,7 +224,7 @@ describe('the Pi extension on /compact and automatic compaction', () => {
     expect(result?.compaction?.summary).toContain('[User]: Fix the failing test.');
     expect(result?.compaction?.details).toMatchObject({ fastJev: { stats: { callsDropped: 3 } } });
     expect(ext.endpoints[0]?.signal).toBe(ext.signal);
-    expect(ext.notes[0]).toMatch(/^fast-jev: \/compact by Jev, no LLM summary \(older history: \d+% reduction; 3 calls stubbed; .* kept verbatim\)$/);
+    expect(ext.notes[0]).toMatch(/^fast-jev: \/compact by Jev, no LLM summary \(older history: \d+% reduction; 3 calls stubbed; .*; context ~5k → .* tokens\)$/);
   });
 
   it('serves automatic and overflow compaction the same way', async () => {
@@ -174,7 +233,34 @@ describe('the Pi extension on /compact and automatic compaction', () => {
     expect((await ext.compact('overflow'))?.compaction).toBeDefined();
   });
 
-  it("leaves the summary to Pi without a key, when Jev fails, below the minimum or over the size budget", async () => {
+  it('carries the previous Jev compaction into the next one and scores it again', async () => {
+    // Round 1 keeps a.ts verbatim; round 2, with more work done, no longer needs it.
+    const first = load(env, asker({ t1: { call: 0.9, result: 0.9 }, t2: { call: 0.1, result: 0.1 }, t3: { call: 0.1, result: 0.1 } }));
+    const round1 = (await first.compact())!.compaction!;
+    expect(round1.summary).toContain(fileA.slice(0, 40));
+
+    const later = messagesOf([
+      user('u3', 'Now also check src/d.ts.'),
+      assistant('a5', [toolCall('c5', 'read', { path: 'src/d.ts' })]),
+      toolResult('r5', 'c5', fileB),
+    ]);
+    const dropAll4 = { ...dropEverything, t4: { call: 0.1, result: 0.1 } };
+    const second = load(env, asker(dropAll4));
+    const round2 = (await second.compact(
+      'threshold',
+      preparation({ messagesToSummarize: [...messagesOf(kept()), ...later], previousSummary: round1.summary }),
+      [
+        { type: 'compaction', id: 'c-1', summary: round1.summary, firstKeptEntryId: 'a4', details: round1.details },
+        { type: 'message', id: 'u3' },
+      ],
+    ))!.compaction!;
+    expect(round2.summary.split('[User]: Fix the failing test.').length).toBe(2);
+    expect(round2.summary).not.toContain(fileA.slice(0, 40));
+    expect(round2.summary).toContain('[User]: Now also check src/d.ts.');
+    expect(round2.summary).not.toContain('<previous-summary>');
+  });
+
+  it("leaves the summary to Pi without a key, when Jev fails or cuts nothing, and when the result stays too large", async () => {
     const noKey = load({}, asker(dropEverything));
     expect(await noKey.compact()).toBeUndefined();
     expect(noKey.notes[0]).toMatch(/TYPESAFE_API_KEY is not set/);
@@ -185,10 +271,26 @@ describe('the Pi extension on /compact and automatic compaction', () => {
 
     const keepsAll = load(env, asker({}));
     expect(await keepsAll.compact()).toBeUndefined();
-    expect(keepsAll.notes[0]).toMatch(/below the 25% minimum/);
+    expect(keepsAll.notes[0]).toMatch(/Jev found nothing stale to cut; Pi summarizes instead/);
 
-    const tinyWindow = load(env, asker(dropEverything), 100);
-    expect(await tinyWindow.compact()).toBeUndefined();
-    expect(tinyWindow.notes[0]).toMatch(/over the 25% budget/);
+    // Only a.ts goes: 200k tokens shrink to ~100k, still over half of the ~84k threshold.
+    const tooLarge = load(env, asker({ t1: { call: 0.1, result: 0.1 } }));
+    expect(await tooLarge.compact('manual', preparation({ tokensBefore: 200_000 }))).toBeUndefined();
+    expect(tooLarge.notes[0]).toMatch(/would leave ~\d+k tokens, over 50% of Pi's ~84k compaction threshold; Pi summarizes instead/);
+  });
+
+  it('compacts a context past the window Pi assumes, when Jev cuts it well', async () => {
+    // Long tool outputs, as in a real session: 366k tokens on a window Pi takes for 272k.
+    const heavy = messagesOf([
+      user('u1', 'Fix the failing test.'),
+      assistant('a1', [toolCall('c1', 'read', { path: 'src/a.ts' })]),
+      toolResult('r1', 'c1', fileA.repeat(40)),
+      assistant('a3', [toolCall('c3', 'read', { path: 'src/b.ts' })]),
+      toolResult('r3', 'c3', fileB.repeat(40)),
+    ]);
+    const ext = load(env, asker(dropEverything), 272_000);
+    const result = await ext.compact('manual', preparation({ tokensBefore: 366_000, messagesToSummarize: heavy }));
+    expect(result?.compaction).toBeDefined();
+    expect(ext.notes[0]).toMatch(/context ~366k → ~\d+k tokens/);
   });
 });

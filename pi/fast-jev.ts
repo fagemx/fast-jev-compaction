@@ -59,14 +59,17 @@ export interface PiSettings {
   baseUrl?: string;
   /** Deadline for one Jev request, body included. */
   timeoutMs: number;
-  /** Largest share of the context window a verbatim compaction summary may take. */
-  summaryShare: number;
+  /**
+   * Largest share of Pi's compaction threshold (window minus reserve) the
+   * context may still take after a Jev compaction; above it Pi summarizes.
+   */
+  compactTarget: number;
 }
 
 /**
  * Settings from the environment: the plugin options from `FAST_JEV_*`
  * variables, `FAST_JEV_PROVIDER` (`typesafe` or `openrouter`),
- * `FAST_JEV_BASE_URL`, `FAST_JEV_TIMEOUT_MS` and `FAST_JEV_SUMMARY_SHARE`. The key is
+ * `FAST_JEV_BASE_URL`, `FAST_JEV_TIMEOUT_MS` and `FAST_JEV_COMPACT_TARGET`. The key is
  * `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` for OpenRouter (which also
  * defaults the model to `typesafe/jev-1.13`).
  */
@@ -86,12 +89,12 @@ export function piSettings(env: Readonly<Record<string, string | undefined>>): P
   if (apiKey) options.apiKey = apiKey;
   if (provider === 'openrouter' && options.model === undefined) options.model = OPENROUTER_JEV_MODEL;
   const timeout = Number(env.FAST_JEV_TIMEOUT_MS);
-  const share = Number(env.FAST_JEV_SUMMARY_SHARE);
+  const target = Number(env.FAST_JEV_COMPACT_TARGET);
   const settings: PiSettings = {
     options,
     provider,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 15_000,
-    summaryShare: Number.isFinite(share) && share > 0 && share <= 1 ? share : 0.25,
+    compactTarget: Number.isFinite(target) && target > 0 && target <= 1 ? target : 0.5,
   };
   const baseUrl = env.FAST_JEV_BASE_URL?.trim();
   if (baseUrl) settings.baseUrl = baseUrl;
@@ -338,11 +341,56 @@ const SUMMARY_HEADER =
 export interface RegionCompaction {
   result: CompactResult;
   summary: string;
+  /** The region as cut, without thinking or image data: what the next compaction carries. */
+  messages: AgentMessage[];
+  readFiles: string[];
+  modifiedFiles: string[];
   /** Characters of the region's transcript before and after the cuts. */
   charsBefore: number;
   charsAfter: number;
   /** Share of the region's characters the cuts take out. */
   ratio: number;
+  /** Estimated share of the whole context, kept window included, left after the compaction. */
+  remaining: number;
+}
+
+/** What a Jev compaction keeps in its entry's `details.fastJev`, for the next one to carry. */
+export interface FastJevDetails {
+  messages: AgentMessage[];
+  readFiles: string[];
+  modifiedFiles: string[];
+  /** The summary, written by Pi, this one was written behind. */
+  previousSummary?: string;
+}
+
+type BranchEntry = SessionBeforeCompactEvent['branchEntries'][number];
+
+/**
+ * The previous compaction's messages, when it was Jev's and is the one Pi is
+ * building on: the next compaction scores them again instead of copying its
+ * text forward, so a result kept then can still be cut later.
+ */
+export function carriedCompaction(
+  entries: readonly BranchEntry[],
+  previousSummary: string | undefined,
+): FastJevDetails | undefined {
+  let latest: BranchEntry | undefined;
+  for (const entry of entries) if (entry.type === 'compaction') latest = entry;
+  if (!latest || latest.type !== 'compaction' || latest.summary !== previousSummary) return undefined;
+  const fastJev = (latest.details as { fastJev?: Partial<FastJevDetails> } | undefined)?.fastJev;
+  return fastJev && Array.isArray(fastJev.messages) ? (fastJev as FastJevDetails) : undefined;
+}
+
+/** A message as a later compaction carries it: thinking dropped, images as a marker. */
+function forCarrying(message: AgentMessage): AgentMessage {
+  if (message.role === 'assistant') {
+    return { ...message, content: message.content.filter((block) => block.type !== 'thinking') };
+  }
+  if ((message.role === 'user' || message.role === 'toolResult' || message.role === 'custom') && Array.isArray(message.content)) {
+    const content = message.content.map((block) => (block.type === 'image' ? { type: 'text' as const, text: '[image]' } : block));
+    return { ...message, content } as AgentMessage;
+  }
+  return message;
 }
 
 /**
@@ -360,7 +408,7 @@ export async function compactRegion(
   extras: {
     previousSummary?: string;
     customInstructions?: string;
-    fileOps?: CompactionPreparation['fileOps'];
+    files?: { read: Iterable<string>; modified: Iterable<string> };
   },
 ): Promise<RegionCompaction> {
   const regionEntries: ProjectedLike[] = region.map((message, index) => ({
@@ -393,21 +441,25 @@ export async function compactRegion(
   const before = write(region);
   const after = write(edited);
 
+  const modified = [...new Set(extras.files?.modified ?? [])].sort();
+  const read = [...new Set(extras.files?.read ?? [])].filter((file) => !modified.includes(file)).sort();
   const sections = [SUMMARY_HEADER];
   if (extras.previousSummary) sections.push(`<previous-summary>\n${extras.previousSummary}\n</previous-summary>`);
   sections.push(`<conversation>\n${after}\n</conversation>`);
-  if (extras.fileOps) {
-    const modified = [...new Set([...extras.fileOps.written, ...extras.fileOps.edited])].sort();
-    const read = [...extras.fileOps.read].filter((file) => !modified.includes(file)).sort();
-    if (read.length > 0) sections.push(`<read-files>\n${read.join('\n')}\n</read-files>`);
-    if (modified.length > 0) sections.push(`<modified-files>\n${modified.join('\n')}\n</modified-files>`);
-  }
+  if (read.length > 0) sections.push(`<read-files>\n${read.join('\n')}\n</read-files>`);
+  if (modified.length > 0) sections.push(`<modified-files>\n${modified.join('\n')}\n</modified-files>`);
+  const summary = sections.join('\n\n');
+  const keptTokens = estimateTokens(write(kept.flatMap((entry) => entry.messages)));
   return {
     result,
-    summary: sections.join('\n\n'),
+    summary,
+    messages: edited.map(forCarrying),
+    readFiles: read,
+    modifiedFiles: modified,
     charsBefore: before.length,
     charsAfter: after.length,
     ratio: before.length === 0 ? 0 : 1 - after.length / before.length,
+    remaining: (estimateTokens(summary) + keptTokens) / Math.max(1, estimateTokens(before) + keptTokens),
   };
 }
 
@@ -415,8 +467,12 @@ function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
+function thousands(tokens: number): string {
+  return tokens < 1000 ? `${Math.round(tokens)}` : `~${Math.round(tokens / 1000)}k`;
+}
+
 function tokenCount(tokens: number): string {
-  return tokens < 1000 ? `${Math.round(tokens)} tokens` : `~${Math.round(tokens / 1000)}k tokens`;
+  return `${thousands(tokens)} tokens`;
 }
 
 /** One line on a run, for the TUI notification. */
@@ -573,38 +629,59 @@ export function createFastJev(
         const { preparation } = event;
         const projection = ctx.sessionManager.buildSessionProjection().entries;
         const first = projection.findIndex((entry) => entry.sourceEntry.id === preparation.firstKeptEntryId);
+        const carried = carriedCompaction(event.branchEntries, preparation.previousSummary);
+        const previousSummary = carried ? carried.previousSummary : preparation.previousSummary;
+        const { fileOps } = preparation;
         const run = await compactRegion(
-          [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages],
+          [...(carried?.messages ?? []), ...preparation.messagesToSummarize, ...preparation.turnPrefixMessages],
           first === -1 ? [] : projection.slice(first),
           config,
           askerFor(endpoint),
           {
-            ...(preparation.previousSummary ? { previousSummary: preparation.previousSummary } : {}),
+            ...(previousSummary ? { previousSummary } : {}),
             ...(event.customInstructions ? { customInstructions: event.customInstructions } : {}),
-            fileOps: preparation.fileOps,
+            files: {
+              read: [...(carried?.readFiles ?? []), ...fileOps.read],
+              modified: [...(carried?.modifiedFiles ?? []), ...fileOps.written, ...fileOps.edited],
+            },
           },
         );
-        const older = `older history: ${describeRun(run)}`;
-        if (run.ratio < config.minReductionRatio) {
-          notify(`${what}: below the ${percent(config.minReductionRatio)} minimum (${older}); Pi summarizes instead`);
+        if (run.charsAfter >= run.charsBefore) {
+          notify(`${what}: Jev found nothing stale to cut; Pi summarizes instead`);
           return;
         }
-        const tokens = estimateTokens(run.summary);
+        // Pi's own threshold, not the window share: Pi's window can be wrong
+        // (openai-codex reports 272k and accepts more), and all that matters
+        // is that the compacted context leaves room before Pi compacts again.
+        const after = Math.round(preparation.tokensBefore * run.remaining);
         const window = ctx.model?.contextWindow ?? ctx.getContextUsage()?.contextWindow;
-        if (window && tokens > window * settings.summaryShare) {
+        const threshold = window ? window - preparation.settings.reserveTokens : 0;
+        if (threshold > 0 && after > threshold * settings.compactTarget) {
           notify(
-            `${what}: the verbatim history would take ${tokenCount(tokens)}, over the ` +
-              `${percent(settings.summaryShare)} budget of the ${tokenCount(window)} window; Pi summarizes instead`,
+            `${what}: Jev's cuts would leave ${tokenCount(after)}, over ${percent(settings.compactTarget)} of ` +
+              `Pi's ${thousands(threshold)} compaction threshold; Pi summarizes instead`,
           );
           return;
         }
-        notify(`${what} by Jev, no LLM summary (${older}; ${tokenCount(tokens)} kept verbatim)`);
+        notify(
+          `${what} by Jev, no LLM summary (older history: ${describeRun(run)}; ` +
+            `context ${thousands(preparation.tokensBefore)} → ${tokenCount(after)})`,
+        );
+        const details: FastJevDetails & Record<string, unknown> = {
+          stats: run.result.stats,
+          decisions: run.result.decisions,
+          ratio: run.ratio,
+          messages: run.messages,
+          readFiles: run.readFiles,
+          modifiedFiles: run.modifiedFiles,
+        };
+        if (previousSummary) details.previousSummary = previousSummary;
         return {
           compaction: {
             summary: run.summary,
             firstKeptEntryId: preparation.firstKeptEntryId,
             tokensBefore: preparation.tokensBefore,
-            details: { fastJev: { stats: run.result.stats, decisions: run.result.decisions, ratio: run.ratio } },
+            details: { fastJev: details },
           },
         };
       } catch (error) {
