@@ -124,6 +124,10 @@ stage was needed, and the number of requests.
   result is safe to delete. The assistant can always re-run the tool.
 - The full state is repeated with every request, so a history near the state
   ceiling costs one request per handful of questions.
+- The state carries the conversation's text and tool inputs to the Jev
+  endpoint. `buildJevRequest` redacts credential-shaped substrings (provider
+  keys, JWTs, `Bearer` values, `KEY=value`, URL passwords, opaque blobs) and the
+  API key itself, but the redaction is pattern-based, not a guarantee.
 
 ## Claude Code plugin
 
@@ -189,7 +193,18 @@ Jev again.
 pi install /path/to/fast-jev-compaction   # or: pi -e /path/to/fast-jev-compaction
 ```
 
-The key comes from `TYPESAFE_API_KEY` in Pi's environment. The plugin options
+The key comes from `TYPESAFE_API_KEY` in Pi's environment. Jev is also served
+through OpenRouter's decisions endpoint (`typesafe/jev-1.13`): with
+`FAST_JEV_PROVIDER=openrouter` the extension asks there, with
+`OPENROUTER_API_KEY` or, when that is unset, Pi's own OpenRouter login.
+`FAST_JEV_BASE_URL` points at any other endpoint with the same protocol.
+Every Jev request ends after `FAST_JEV_TIMEOUT_MS` (15000) or when the turn is
+interrupted, so a stalled endpoint cannot hold Pi; the goal Jev scores against
+is taken from the user's own prompts only, not Pi's summaries, bash runs or
+other extensions' messages. As for every transport, credential-shaped text is
+redacted from the request before it leaves the machine.
+
+The plugin options
 are read from `FAST_JEV_*` variables: `FAST_JEV_COMPACT_AT_PERCENT`,
 `FAST_JEV_MIN_REDUCTION_RATIO`, `FAST_JEV_KEEP_THRESHOLD`,
 `FAST_JEV_PRESERVE_RECENT_MESSAGES`, `FAST_JEV_MAX_STATE_TOKENS`,

@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type {
   ContextEditEntryDraft,
   ExtensionAPI,
@@ -14,8 +16,12 @@ import {
   createFastJev,
   CUSTOM_TYPE,
   envName,
-  optionsFromEnv,
+  OPENROUTER_DECISIONS_URL,
+  OPENROUTER_JEV_MODEL,
+  piSettings,
+  timedAsker,
   toTranscript,
+  type JevEndpoint,
 } from '../pi/fast-jev.ts';
 import { resolveHookConfig } from '../hooks/fast-jev.ts';
 import type { JevAsker } from '../src/index.js';
@@ -126,6 +132,17 @@ describe('toTranscript', () => {
     ]);
     expect(transcript.messages.map((m) => m.text)).toEqual(['Earlier work', '$ ls\na.ts', '']);
   });
+
+  it('takes the goal from user prompts only, not summaries, bash runs or other extensions', () => {
+    const transcript = toTranscript([
+      user('u1', 'Fix the failing test.'),
+      entry('s', { role: 'compactionSummary', summary: 'Earlier work', timestamp: 0 }),
+      user('u2', 'Then update the docs.'),
+      entry('b', { role: 'bashExecution', command: 'ls', output: 'a.ts', timestamp: 0 }),
+      entry('c', { role: 'custom', content: 'Subagent finished: 3 files', timestamp: 0 }),
+    ]);
+    expect(transcript.goal).toBe('Fix the failing test.\nThen update the docs.');
+  });
 });
 
 /** The projection Pi rebuilds after the edits: each target's content replaced. */
@@ -229,27 +246,73 @@ describe('compactEntries', () => {
   });
 });
 
-describe('options from the environment', () => {
+describe('settings from the environment', () => {
   it('reads FAST_JEV_* variables and TYPESAFE_API_KEY', () => {
     expect(envName('preserveRecentMessages')).toBe('FAST_JEV_PRESERVE_RECENT_MESSAGES');
-    const options = optionsFromEnv({
+    const settings = piSettings({
       TYPESAFE_API_KEY: 'k',
+      OPENROUTER_API_KEY: 'or',
       FAST_JEV_COMPACT_AT_PERCENT: '40',
       FAST_JEV_KEEP_THRESHOLD: 'nope',
       FAST_JEV_MODEL: 'jev-x',
       FAST_JEV_TRUNCATE_HEAD_CHARS: ' ',
     });
-    expect(resolveHookConfig(options)).toEqual({
+    expect(resolveHookConfig(settings.options)).toEqual({
       apiKey: 'k',
       compactAtPercent: 40,
       minReductionRatio: 0.25,
       model: 'jev-x',
     });
+    expect(settings).toMatchObject({ provider: 'typesafe', timeoutMs: 15_000 });
+    expect(settings.baseUrl).toBeUndefined();
+  });
+
+  it('points OpenRouter at its decisions endpoint, Jev model and key', () => {
+    const settings = piSettings({
+      FAST_JEV_PROVIDER: 'OpenRouter',
+      TYPESAFE_API_KEY: 'k',
+      OPENROUTER_API_KEY: 'or',
+      FAST_JEV_TIMEOUT_MS: '2500',
+    });
+    expect(settings).toMatchObject({ provider: 'openrouter', baseUrl: OPENROUTER_DECISIONS_URL, timeoutMs: 2500 });
+    expect(resolveHookConfig(settings.options)).toMatchObject({ apiKey: 'or', model: OPENROUTER_JEV_MODEL });
+    expect(piSettings({ FAST_JEV_PROVIDER: 'openrouter', FAST_JEV_MODEL: 'typesafe/jev-2', FAST_JEV_BASE_URL: 'http://127.0.0.1:9/x' }))
+      .toMatchObject({ baseUrl: 'http://127.0.0.1:9/x', options: { model: 'typesafe/jev-2' } });
+  });
+});
+
+describe('timedAsker', () => {
+  // A Jev endpoint that accepts the request and never answers.
+  let server: Server;
+  let url: string;
+  beforeAll(async () => {
+    server = createServer(() => {});
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/systemone`;
+  });
+  afterAll(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+
+  it('gives up at the deadline', async () => {
+    const started = Date.now();
+    const jev = timedAsker({ apiKey: 'k', model: 'jev-latest', baseUrl: url, timeoutMs: 200 });
+    await expect(jev.ask({}, {})).rejects.toMatchObject({ name: 'TimeoutError' });
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('stops when the turn is aborted', async () => {
+    const turn = new AbortController();
+    const jev = timedAsker({ apiKey: 'k', model: 'jev-latest', baseUrl: url, timeoutMs: 10_000, signal: turn.signal });
+    const asked = jev.ask({}, {});
+    turn.abort();
+    await expect(asked).rejects.toMatchObject({ name: 'AbortError' });
   });
 });
 
 describe('the Pi extension', () => {
-  function load(env: Record<string, string>, jev: JevAsker) {
+  function load(env: Record<string, string>, jev: JevAsker, piKeys: Record<string, string> = {}) {
     let handler: ((event: TurnEndEvent, ctx: ExtensionContext) => unknown) | undefined;
     const pi = {
       on(_event: 'turn_end', h: typeof handler) {
@@ -257,15 +320,22 @@ describe('the Pi extension', () => {
         return () => {};
       },
     } as unknown as ExtensionAPI;
-    createFastJev(env, () => jev)(pi);
+    const endpoints: JevEndpoint[] = [];
+    createFastJev(env, (endpoint) => {
+      endpoints.push(endpoint);
+      return jev;
+    })(pi);
     const notes: string[] = [];
     return {
       notes,
+      endpoints,
       async turnEnd(percent: number): Promise<TurnEndEventResult | undefined> {
         const prior = { type: 'custom' as const, customType: 'other' };
         const ctx: ExtensionContext = {
           hasUI: true,
           ui: { notify: (message) => notes.push(message) },
+          signal: undefined,
+          modelRegistry: { getApiKeyForProvider: async (provider) => piKeys[provider] },
           getContextUsage: () => ({ tokens: percent * 1000, contextWindow: 100_000, percent }),
         };
         const event: TurnEndEvent = {
@@ -317,5 +387,23 @@ describe('the Pi extension', () => {
     const failing = load(env, { ask: async () => Promise.reject(new Error('Jev 503')) });
     expect(await failing.turnEnd(90)).toBeUndefined();
     expect(failing.notes[0]).toMatch(/skipped \(Jev 503\)/);
+
+    const slow = load(env, { ask: async () => Promise.reject(new DOMException('timed out', 'TimeoutError')) });
+    expect(await slow.turnEnd(90)).toBeUndefined();
+    expect(slow.notes[0]).toMatch(/skipped \(no Jev answer within 15 s\)/);
+  });
+
+  it("asks Jev through OpenRouter with Pi's own OpenRouter login when no key is set", async () => {
+    const ext = load({ FAST_JEV_PROVIDER: 'openrouter', FAST_JEV_PRESERVE_RECENT_MESSAGES: '0' }, dropAll, {
+      openrouter: 'pi-openrouter-key',
+    });
+    expect(await ext.turnEnd(90)).toBeDefined();
+    expect(ext.endpoints).toEqual([
+      { apiKey: 'pi-openrouter-key', model: OPENROUTER_JEV_MODEL, baseUrl: OPENROUTER_DECISIONS_URL, timeoutMs: 15_000 },
+    ]);
+
+    const none = load({ FAST_JEV_PROVIDER: 'openrouter' }, dropAll);
+    expect(await none.turnEnd(90)).toBeUndefined();
+    expect(none.notes[0]).toMatch(/no OpenRouter key/);
   });
 });

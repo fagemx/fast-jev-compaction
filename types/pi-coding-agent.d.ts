@@ -99,6 +99,9 @@ declare module '@earendil-works/pi-coding-agent' {
   export interface ExtensionContext {
     hasUI: boolean;
     ui: { notify(message: string, type?: 'info' | 'warning' | 'error'): void };
+    /** The current abort signal, or undefined when the agent is not streaming. */
+    signal: AbortSignal | undefined;
+    modelRegistry: { getApiKeyForProvider(provider: string): Promise<string | undefined> };
     getContextUsage(): ContextUsage | undefined;
   }
 

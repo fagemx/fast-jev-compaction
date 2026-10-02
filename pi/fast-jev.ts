@@ -8,7 +8,7 @@ import type {
 import { resolveHookConfig, type HookConfig } from '../hooks/fast-jev.js';
 import { JevClient } from '../src/client.js';
 import { compact, resolveOptions, truncatedResultText } from '../src/compact.js';
-import { headOf } from '../src/state.js';
+import { goalFromMessages, headOf } from '../src/state.js';
 import type { CompactResult, JevAsker, Message, ToolUse } from '../src/types.js';
 
 /** `customType` of the session entry recording each run's stats and decisions. */
@@ -16,6 +16,10 @@ export const CUSTOM_TYPE = 'fast-jev-compaction';
 
 /** After a run, wait until this share of the context window has accrued again. */
 const RETRY_GROWTH = 0.1;
+
+/** Jev through OpenRouter: same request and answers as System One. */
+export const OPENROUTER_DECISIONS_URL = 'https://openrouter.ai/api/alpha/decisions';
+export const OPENROUTER_JEV_MODEL = 'typesafe/jev-1.13';
 
 // Pi's message and content types, from the one module an extension can rely on.
 type AgentMessage = ProjectedSessionEntry['messages'][number];
@@ -39,11 +43,27 @@ export function envName(option: string): string {
   return `FAST_JEV_${option.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 }
 
+/** Where Jev is asked: TypeSafe System One directly, or OpenRouter. */
+export type Provider = 'typesafe' | 'openrouter';
+
+export interface PiSettings {
+  /** The Claude Code plugin's options; `resolveHookConfig` fills in the defaults. */
+  options: Record<string, string | number>;
+  provider: Provider;
+  /** Endpoint override; unset uses the provider's own. */
+  baseUrl?: string;
+  /** Deadline for one Jev request, body included. */
+  timeoutMs: number;
+}
+
 /**
- * The Claude Code plugin's options, read from `FAST_JEV_*` variables, with the
- * key from `TYPESAFE_API_KEY`; `resolveHookConfig` fills in the defaults.
+ * Settings from the environment: the plugin options from `FAST_JEV_*`
+ * variables, `FAST_JEV_PROVIDER` (`typesafe` or `openrouter`),
+ * `FAST_JEV_BASE_URL` and `FAST_JEV_TIMEOUT_MS`. The key is
+ * `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` for OpenRouter (which also
+ * defaults the model to `typesafe/jev-1.13`).
  */
-export function optionsFromEnv(env: Readonly<Record<string, string | undefined>>): Record<string, string | number> {
+export function piSettings(env: Readonly<Record<string, string | undefined>>): PiSettings {
   const options: Record<string, string | number> = {};
   for (const option of NUMBER_OPTIONS) {
     const raw = env[envName(option)];
@@ -53,8 +73,21 @@ export function optionsFromEnv(env: Readonly<Record<string, string | undefined>>
     const raw = env[envName(option)];
     if (raw) options[option] = raw;
   }
-  if (env.TYPESAFE_API_KEY) options.apiKey = env.TYPESAFE_API_KEY;
-  return options;
+  const provider: Provider =
+    env.FAST_JEV_PROVIDER?.trim().toLowerCase() === 'openrouter' ? 'openrouter' : 'typesafe';
+  const apiKey = provider === 'openrouter' ? env.OPENROUTER_API_KEY : env.TYPESAFE_API_KEY;
+  if (apiKey) options.apiKey = apiKey;
+  if (provider === 'openrouter' && options.model === undefined) options.model = OPENROUTER_JEV_MODEL;
+  const timeout = Number(env.FAST_JEV_TIMEOUT_MS);
+  const settings: PiSettings = {
+    options,
+    provider,
+    timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 15_000,
+  };
+  const baseUrl = env.FAST_JEV_BASE_URL?.trim();
+  if (baseUrl) settings.baseUrl = baseUrl;
+  else if (provider === 'openrouter') settings.baseUrl = OPENROUTER_DECISIONS_URL;
+  return settings;
 }
 
 function contentText(content: string | readonly ContentBlock[]): string {
@@ -90,6 +123,8 @@ export interface PiTranscript {
   results: Map<string, { entryId: string; text: string; isError: boolean }>;
   /** The projected assistant message of each entry holding tool calls. */
   assistants: Map<string, AssistantMessage>;
+  /** The last user prompts, without summaries, bash runs or other extensions' messages. */
+  goal: string;
 }
 
 /**
@@ -103,7 +138,9 @@ export function toTranscript(entries: readonly ProjectedSessionEntry[]): PiTrans
     callEntries: new Map(),
     results: new Map(),
     assistants: new Map(),
+    goal: '',
   };
+  const prompts: Message[] = [];
   let resultRun: Message | undefined;
   for (const { sourceEntry, messages } of entries) {
     for (const message of messages) {
@@ -124,7 +161,9 @@ export function toTranscript(entries: readonly ProjectedSessionEntry[]): PiTrans
       }
       resultRun = undefined;
       if (message.role !== 'assistant') {
-        transcript.messages.push({ role: 'user', text: messageText(message), toolUses: [] });
+        const text: Message = { role: 'user', text: messageText(message), toolUses: [] };
+        transcript.messages.push(text);
+        if (message.role === 'user') prompts.push(text);
         continue;
       }
       const toolUses: ToolUse[] = [];
@@ -137,6 +176,7 @@ export function toTranscript(entries: readonly ProjectedSessionEntry[]): PiTrans
       transcript.messages.push({ role: 'assistant', text: contentText(message.content), toolUses });
     }
   }
+  transcript.goal = goalFromMessages(prompts);
   return transcript;
 }
 
@@ -229,7 +269,10 @@ export async function compactEntries(
   asker: JevAsker,
 ): Promise<PiCompaction> {
   const transcript = toTranscript(entries);
-  const result = await compact(transcript.messages, asker, config);
+  // Pi's summaries, bash runs and other extensions' messages are user-role
+  // text too; the default goal would take them for the task.
+  const goal = config.goal || transcript.goal;
+  const result = await compact(transcript.messages, asker, { ...config, goal });
   const { edits, charsSaved } = contextEdits(
     transcript,
     result.messages,
@@ -255,23 +298,47 @@ export function describeRun({ result, ratio }: Pick<PiCompaction, 'result' | 'ra
   return `${percent(ratio)} reduction; ${parts.join(', ') || 'no tool calls'}; ${stats.requests} Jev request(s) in ${stats.ms} ms`;
 }
 
+/** What one run asks Jev through. */
+export interface JevEndpoint {
+  apiKey: string;
+  model: string;
+  baseUrl?: string;
+  timeoutMs: number;
+  /** The turn's signal: interrupting Pi stops the Jev requests too. */
+  signal?: AbortSignal;
+}
+
+/**
+ * A `JevClient` whose every request (body included) ends at the deadline or
+ * when the turn is aborted. Pi awaits `turn_end`, so a Jev request that never
+ * answered would otherwise hold the whole agent.
+ */
+export function timedAsker({ apiKey, model, baseUrl, timeoutMs, signal }: JevEndpoint): JevAsker {
+  const timed: typeof fetch = (input, init) =>
+    fetch(input, {
+      ...init,
+      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]),
+    });
+  return new JevClient({ apiKey, model, baseUrl, fetch: timed });
+}
+
 /**
  * The Pi extension. At the end of a turn whose context is at or above
  * `compactAtPercent`, Jev decides which older tool calls and results still
  * matter, and the rest shrink in the model context through append-only
  * `context_edit` entries (see `contextEdits`); everything kept stays
- * verbatim, no summary. Below `minReductionRatio`, or
- * when Jev fails, nothing changes and Pi's own summary compaction stays the
- * fallback. A run is retried only after the context grows by another 10% of
- * the window, or after it drops below the threshold.
+ * verbatim, no summary. Below `minReductionRatio`, without a key, or when Jev
+ * fails or times out, nothing changes and Pi's own summary compaction stays
+ * the fallback. A run is retried only after the context grows by another 10%
+ * of the window, or after it drops below the threshold.
  */
 export function createFastJev(
   env: Readonly<Record<string, string | undefined>> = process.env,
-  askerFor: (config: HookConfig) => JevAsker = (config) =>
-    new JevClient({ apiKey: config.apiKey, model: config.model }),
+  askerFor: (endpoint: JevEndpoint) => JevAsker = timedAsker,
 ) {
   return (pi: ExtensionAPI): void => {
-    const config = resolveHookConfig(optionsFromEnv(env));
+    const settings = piSettings(env);
+    const config = resolveHookConfig(settings.options);
     let lastAttemptTokens: number | undefined;
 
     pi.on('turn_end', async (event, ctx) => {
@@ -292,12 +359,27 @@ export function createFastJev(
       const notify = (text: string, type: 'info' | 'warning' = 'info') => {
         if (ctx.hasUI) ctx.ui.notify(`fast-jev: ${text}`, type);
       };
-      if (!config.apiKey) {
-        notify("TYPESAFE_API_KEY is not set; Pi's built-in compaction stays in charge", 'warning');
-        return;
-      }
       try {
-        const run = await compactEntries(event.context.contextEntries, config, askerFor(config));
+        // Without OPENROUTER_API_KEY, OpenRouter falls back to Pi's own login.
+        const apiKey =
+          config.apiKey ??
+          (settings.provider === 'openrouter'
+            ? await ctx.modelRegistry.getApiKeyForProvider('openrouter')
+            : undefined);
+        if (!apiKey) {
+          notify(
+            settings.provider === 'openrouter'
+              ? "no OpenRouter key (OPENROUTER_API_KEY or Pi's OpenRouter login); Pi's built-in compaction stays in charge"
+              : "TYPESAFE_API_KEY is not set; Pi's built-in compaction stays in charge",
+            'warning',
+          );
+          return;
+        }
+        const endpoint: JevEndpoint = { apiKey, model: config.model, timeoutMs: settings.timeoutMs };
+        if (settings.baseUrl) endpoint.baseUrl = settings.baseUrl;
+        if (ctx.signal) endpoint.signal = ctx.signal;
+
+        const run = await compactEntries(event.context.contextEntries, config, askerFor(endpoint));
         const { stats, decisions } = run.result;
         // Stubs keep every message; only characters leave the context.
         const charsAfter = stats.charsBefore - run.charsSaved;
@@ -314,10 +396,13 @@ export function createFastJev(
         notify(`${edits.length} context edits, no summary (${describeRun(run)})`);
         return { entries: [...event.entries, ...edits, record] };
       } catch (error) {
-        notify(
-          `skipped (${error instanceof Error ? error.message : String(error)}); Pi's compaction stays the fallback`,
-          'warning',
-        );
+        const reason =
+          error instanceof Error && error.name === 'TimeoutError'
+            ? `no Jev answer within ${settings.timeoutMs / 1000} s`
+            : error instanceof Error
+              ? error.message
+              : String(error);
+        notify(`skipped (${reason}); Pi's compaction stays the fallback`, 'warning');
         return;
       }
     });
