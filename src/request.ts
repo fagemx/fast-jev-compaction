@@ -1,4 +1,5 @@
 import type { JevAnswer, JevQuestions, JevResponse, JevState } from './types.js';
+import { redactDeep } from './redact.js';
 
 export const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
 export const DEFAULT_MODEL = 'jev-latest';
@@ -10,7 +11,12 @@ export interface JevRequest {
   body: string;
 }
 
-/** The HTTP request for one Jev call, for any fetch-like transport. */
+/**
+ * The HTTP request for one Jev call, for any fetch-like transport. Anything
+ * credential-shaped in the state and questions, and the key itself, is
+ * replaced by `[REDACTED]` before it leaves the machine; the key travels only
+ * in the header.
+ */
 export function buildJevRequest(
   params: {
     apiKey: string;
@@ -29,8 +35,8 @@ export function buildJevRequest(
     },
     body: JSON.stringify({
       model: params.model ?? DEFAULT_MODEL,
-      state,
-      questions,
+      state: redactDeep(state, [params.apiKey]).value,
+      questions: redactDeep(questions, [params.apiKey]).value,
     }),
   };
 }
